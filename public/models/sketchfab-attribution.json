@@ -1,0 +1,62 @@
+[
+  {
+    "role": "player",
+    "uid": "a185c8bb6e9d43e4b597b856b176d768",
+    "name": "X-Wing",
+    "creator": "chris_warstat",
+    "modelUrl": "https://sketchfab.com/3d-models/x-wing-a185c8bb6e9d43e4b597b856b176d768",
+    "triangles": 218649,
+    "vertices": 116019,
+    "license": "CC Attribution",
+    "licenseUrl": "http://creativecommons.org/licenses/by/4.0/",
+    "importedAt": "2026-07-29T06:12:34.455Z"
+  },
+  {
+    "role": "fighter",
+    "uid": "722a39247ee84ed892bdc01e22bfbc36",
+    "name": "Tie Fighter",
+    "creator": "Cristianolop",
+    "modelUrl": "https://sketchfab.com/3d-models/tie-fighter-722a39247ee84ed892bdc01e22bfbc36",
+    "triangles": 175787,
+    "vertices": 96295,
+    "license": "CC Attribution",
+    "licenseUrl": "http://creativecommons.org/licenses/by/4.0/",
+    "importedAt": "2026-07-29T06:12:50.861Z"
+  },
+  {
+    "role": "interceptor",
+    "uid": "47222ad5bcff43fe868b65a06009e870",
+    "name": "Star Wars: TIE Interceptor Emperors Royal Guard",
+    "creator": "DanielAndersson",
+    "modelUrl": "https://sketchfab.com/3d-models/star-wars-tie-interceptor-emperors-royal-guard-47222ad5bcff43fe868b65a06009e870",
+    "triangles": 117177,
+    "vertices": 81456,
+    "license": "CC Attribution",
+    "licenseUrl": "http://creativecommons.org/licenses/by/4.0/",
+    "importedAt": "2026-07-29T06:12:57.995Z"
+  },
+  {
+    "role": "bomber",
+    "uid": "9f7e360e2c074db1b9ccabd5dc4b8302",
+    "name": "B-2 spirit",
+    "creator": "hilosrun",
+    "modelUrl": "https://sketchfab.com/3d-models/b-2-spirit-9f7e360e2c074db1b9ccabd5dc4b8302",
+    "triangles": 61699,
+    "vertices": 31620,
+    "license": "CC Attribution",
+    "licenseUrl": "http://creativecommons.org/licenses/by/4.0/",
+    "importedAt": "2026-07-29T06:13:08.146Z"
+  },
+  {
+    "role": "asteroid",
+    "uid": "adde1ecf129e4509be8af61b84bafa85",
+    "name": "Asteroids Pack (rocky version)",
+    "creator": "SebastianSosnowski",
+    "modelUrl": "https://sketchfab.com/3d-models/asteroids-pack-rocky-version-adde1ecf129e4509be8af61b84bafa85",
+    "triangles": 23076,
+    "vertices": 11558,
+    "license": "CC Attribution",
+    "licenseUrl": "http://creativecommons.org/licenses/by/4.0/",
+    "importedAt": "2026-07-29T06:13:25.039Z"
+  }
+]
