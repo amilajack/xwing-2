@@ -925,6 +925,10 @@ class SynthAudio {
     source.stop(now + (large ? 0.5 : 0.18));
   }
 
+  suspend() {
+    void this.context?.suspend();
+  }
+
   dispose() {
     this.engine?.stop();
     void this.context?.close();
@@ -1512,11 +1516,13 @@ class DogfightEngine {
 
   pause() {
     if (this.status !== "playing") return;
+    this.audio.suspend();
     this.setStatus("paused");
   }
 
   resume() {
     if (this.status !== "paused") return;
+    this.audio.ensure();
     this.accumulator = 0;
     this.setStatus("playing");
   }
