@@ -23,6 +23,7 @@ declare global {
     __rogueVectorQa?: {
       stageFleet: () => void;
       steerForSteps: (steerX: number, steerY: number, steps: number) => void;
+      boostForSteps: (steps: number) => number;
       snapshot: () => {
         status: GameStatus;
         quality: QualityName;
@@ -30,6 +31,8 @@ declare global {
         activeEnemies: Record<EnemyKind, number>;
         activeProjectiles: number;
         speed: number;
+        boostActive: boolean;
+        boostRemaining: number;
         sideways: boolean;
         playerPosition: [number, number, number];
         playerForward: [number, number, number];
@@ -81,6 +84,8 @@ type HudSnapshot = {
   hull: number;
   speed: number;
   engineRamp: number;
+  boost: number;
+  boostActive: boolean;
   wave: number;
   score: number;
   enemies: number;
@@ -183,6 +188,15 @@ const MAX_PITCH_RATE = THREE.MathUtils.degToRad(78);
 const MAX_YAW_RATE = THREE.MathUtils.degToRad(92);
 const FLIGHT_CONTROL_RESPONSE = 7;
 const ARENA_HALF_EXTENT = 700;
+// The afterburner reservoir holds ten seconds of thrust. It only refills while
+// the burner is off, so a single hold can never exceed BOOST_MAX_SECONDS.
+const BOOST_MAX_SECONDS = 10;
+const BOOST_RECHARGE_PER_SECOND = 0.5;
+const BOOST_REARM_SECONDS = BOOST_MAX_SECONDS * 0.25;
+const BOOST_SPEED_FACTOR = 2.2;
+const BOOST_RESPONSE = 4.5;
+const BOOST_FOV_KICK = 14;
+const BOOST_CHASE_PULLBACK = 16;
 const PLAYER_XWING_VISUAL_SCALE = 5;
 const SHIP_DISPLAY_SIZE: Record<ShipRole, number> = {
   player: 9.8 * PLAYER_XWING_VISUAL_SCALE,
@@ -224,6 +238,8 @@ const EMPTY_HUD: HudSnapshot = {
   hull: 100,
   speed: 0,
   engineRamp: 0,
+  boost: 100,
+  boostActive: false,
   wave: 1,
   score: 0,
   enemies: 0,
@@ -979,6 +995,10 @@ class DogfightEngine {
   private sidewaysTween = 1;
   private speedMultiplier = 4;
   private speed = 70;
+  private boostRemaining = BOOST_MAX_SECONDS;
+  private boostActive = false;
+  private boostLocked = false;
+  private boostBlend = 0;
   private readonly angularVelocity = new THREE.Vector3();
   private shields = 100;
   private hull = 100;
@@ -1063,8 +1083,21 @@ class DogfightEngine {
         this.mouseYPercent = clamp(steerY, -1, 1);
         const boundedSteps = clamp(Math.floor(steps), 1, 360);
         for (let step = 0; step < boundedSteps; step += 1) {
-          this.updatePlayer(FIXED_STEP, { fire: false });
+          this.updatePlayer(FIXED_STEP, { fire: false, boost: false });
         }
+      },
+      // Holds the burner down for `steps` fixed updates and reports the
+      // longest uninterrupted stretch, in seconds, that it stayed lit.
+      boostForSteps: (steps) => {
+        const boundedSteps = clamp(Math.floor(steps), 1, 6000);
+        let longestRun = 0;
+        let currentRun = 0;
+        for (let step = 0; step < boundedSteps; step += 1) {
+          this.updatePlayer(FIXED_STEP, { fire: false, boost: true });
+          currentRun = this.boostActive ? currentRun + 1 : 0;
+          longestRun = Math.max(longestRun, currentRun);
+        }
+        return longestRun * FIXED_STEP;
       },
       snapshot: () => {
         const activeEnemies = {
@@ -1087,6 +1120,8 @@ class DogfightEngine {
             (projectile) => projectile.active,
           ).length,
           speed: this.speed,
+          boostActive: this.boostActive,
+          boostRemaining: this.boostRemaining,
           sideways: this.sideways,
           playerPosition: this.player.position.toArray(),
           playerForward: playerForward.toArray(),
@@ -1372,6 +1407,7 @@ class DogfightEngine {
   private bindEvents() {
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
+    window.addEventListener("blur", this.onBlur);
     window.addEventListener("mousemove", this.onMouseMove);
     window.addEventListener("mouseup", this.onCanvasMouseUp);
     window.addEventListener("resize", this.resize, { passive: true });
@@ -1412,6 +1448,12 @@ class DogfightEngine {
 
   private onKeyUp = (event: KeyboardEvent) => {
     this.keys.delete(event.code);
+  };
+
+  // Losing focus swallows the matching keyup, which would otherwise leave the
+  // afterburner held down and silently drain the reservoir.
+  private onBlur = () => {
+    this.keys.clear();
   };
 
   private onMouseMove = (event: MouseEvent) => {
@@ -1557,6 +1599,10 @@ class DogfightEngine {
     this.sidewaysTween = 1;
     this.speedMultiplier = 4;
     this.speed = 70;
+    this.boostRemaining = BOOST_MAX_SECONDS;
+    this.boostActive = false;
+    this.boostLocked = false;
+    this.boostBlend = 0;
     this.angularVelocity.set(0, 0, 0);
     this.shields = 100;
     this.hull = 100;
@@ -1773,6 +1819,7 @@ class DogfightEngine {
       this.mouseFire ||
       this.keys.has("ControlLeft") ||
       this.keys.has("ControlRight");
+    let boost = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight");
 
     const gamepads = navigator.getGamepads?.() ?? [];
     const gamepad = Array.from(gamepads).find(
@@ -1788,6 +1835,7 @@ class DogfightEngine {
         this.mouseYPercent = deadzone(gamepad.axes[1] ?? 0);
       }
       fire ||= (gamepad.buttons[7]?.value ?? 0) > 0.25;
+      boost ||= (gamepad.buttons[6]?.value ?? 0) > 0.25;
       const sidewaysPressed = Boolean(gamepad.buttons[0]?.pressed);
       if (sidewaysPressed && !this.lastGamepadSideways) this.toggleSideways();
       this.lastGamepadSideways = sidewaysPressed;
@@ -1801,12 +1849,45 @@ class DogfightEngine {
 
     this.mouseXPercent = clamp(this.mouseXPercent, -1, 1);
     this.mouseYPercent = clamp(this.mouseYPercent, -1, 1);
-    return { fire };
+    return { fire, boost };
   }
 
-  private updatePlayer(delta: number, input: { fire: boolean }) {
+  private updateBoost(delta: number, held: boolean) {
+    if (held && !this.boostLocked && this.boostRemaining > 0) {
+      this.boostActive = true;
+      this.boostRemaining = Math.max(0, this.boostRemaining - delta);
+      // Draining to empty locks the burner out until the reservoir has
+      // recovered, so the pilot cannot chain two full-length burns.
+      if (this.boostRemaining === 0) {
+        this.boostActive = false;
+        this.boostLocked = true;
+      }
+    } else {
+      this.boostActive = false;
+      this.boostRemaining = Math.min(
+        BOOST_MAX_SECONDS,
+        this.boostRemaining + delta * BOOST_RECHARGE_PER_SECOND,
+      );
+      if (this.boostLocked && this.boostRemaining >= BOOST_REARM_SECONDS) {
+        this.boostLocked = false;
+      }
+    }
+
+    this.boostBlend = THREE.MathUtils.damp(
+      this.boostBlend,
+      this.boostActive ? 1 : 0,
+      BOOST_RESPONSE,
+      delta,
+    );
+  }
+
+  private updatePlayer(delta: number, input: { fire: boolean; boost: boolean }) {
     this.speedMultiplier = Math.min(9, this.speedMultiplier + 0.001);
-    this.speed = this.speedMultiplier * REFERENCE_SPEED_SCALE;
+    this.updateBoost(delta, input.boost);
+    this.speed =
+      this.speedMultiplier *
+      REFERENCE_SPEED_SCALE *
+      (1 + this.boostBlend * (BOOST_SPEED_FACTOR - 1));
 
     const previousProfileRotation = this.sidewaysRotation;
     if (this.sidewaysTween < 1) {
@@ -1850,7 +1931,7 @@ class DogfightEngine {
       .copy(LOCAL_FORWARD)
       .applyQuaternion(this.player.quaternion);
     this.player.position.addScaledVector(playerForward, this.speed * delta);
-    this.audio.setEngine(this.speed, false);
+    this.audio.setEngine(this.speed, this.boostActive);
 
     if (input.fire && this.fireCooldown <= 0) {
       this.firePlayerLaser();
@@ -2226,7 +2307,9 @@ class DogfightEngine {
   }
 
   private updateCamera(delta: number) {
-    const targetFov = this.cameraMode === "COCKPIT" ? 67 : 50;
+    const targetFov =
+      (this.cameraMode === "COCKPIT" ? 67 : 50) +
+      this.boostBlend * BOOST_FOV_KICK;
     this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, delta * 5);
     this.camera.updateProjectionMatrix();
 
@@ -2240,7 +2323,10 @@ class DogfightEngine {
         .applyQuaternion(this.player.quaternion);
       this.tempV3
         .copy(this.player.position)
-        .addScaledVector(playerForward, -42)
+        .addScaledVector(
+          playerForward,
+          -42 - this.boostBlend * BOOST_CHASE_PULLBACK,
+        )
         .addScaledVector(playerUp, 15);
       this.camera.position.lerp(this.tempV3, followAlpha);
       this.camera.up.lerp(playerUp, followAlpha).normalize();
@@ -2362,6 +2448,8 @@ class DogfightEngine {
       hull: this.hull,
       speed: this.speed,
       engineRamp: clamp(((this.speedMultiplier - 4) / 5) * 100, 0, 100),
+      boost: clamp((this.boostRemaining / BOOST_MAX_SECONDS) * 100, 0, 100),
+      boostActive: this.boostActive,
       wave: this.wave,
       score: this.score,
       enemies: this.activeEnemyCount(),
@@ -2404,6 +2492,7 @@ class DogfightEngine {
     this.resizeObserver?.disconnect();
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
+    window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("mousemove", this.onMouseMove);
     window.removeEventListener("mouseup", this.onCanvasMouseUp);
     window.removeEventListener("resize", this.resize);
@@ -2748,6 +2837,10 @@ function ControlsPanel({ onClose }: { onClose: () => void }) {
               <kbd>Right click / Ctrl</kbd>
             </div>
             <div className="control-line">
+              <span>Afterburner (hold, 10s)</span>
+              <kbd>Shift</kbd>
+            </div>
+            <div className="control-line">
               <span>Camera / diagnostics</span>
               <kbd>C / P</kbd>
             </div>
@@ -2765,6 +2858,10 @@ function ControlsPanel({ onClose }: { onClose: () => void }) {
             <div className="control-line">
               <span>Fire</span>
               <kbd>RT</kbd>
+            </div>
+            <div className="control-line">
+              <span>Afterburner (hold, 10s)</span>
+              <kbd>LT</kbd>
             </div>
             <div className="control-line">
               <span>Camera</span>
@@ -2822,6 +2919,16 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
           <span
             style={{ "--value": `${hud.engineRamp}%` } as React.CSSProperties}
           />
+        </div>
+        <div className="system-label">
+          <span>Afterburner</span>
+          <strong>{(hud.boost * 0.1).toFixed(1)}s</strong>
+        </div>
+        <div
+          className={`meter${hud.boostActive ? " meter-active" : ""}`}
+          style={{ "--bar": "#ff6b3d" } as React.CSSProperties}
+        >
+          <span style={{ "--value": `${hud.boost}%` } as React.CSSProperties} />
         </div>
         <div className="system-label">
           <span>Velocity</span>

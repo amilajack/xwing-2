@@ -181,6 +181,29 @@ button {
   transition: width 140ms linear;
 }
 
+.meter-active {
+  border-color: var(--bar, var(--cyan));
+}
+
+.meter-active > span {
+  animation: meter-burn 420ms ease-in-out infinite alternate;
+}
+
+@keyframes meter-burn {
+  from {
+    box-shadow: 0 0 12px var(--bar, var(--cyan));
+  }
+  to {
+    box-shadow: 0 0 22px var(--bar, var(--cyan));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meter-active > span {
+    animation: none;
+  }
+}
+
 .radar {
   position: absolute;
   right: 28px;
