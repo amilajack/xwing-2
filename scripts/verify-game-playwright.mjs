@@ -189,6 +189,7 @@ try {
   await page.getByRole("button", { name: "Controls" }).click();
   await page.getByText("Right click / Ctrl").waitFor();
   await page.getByText("Left click / Space").waitFor();
+  await page.getByText("Afterburner (hold, 10s)").first().waitFor();
   await page.getByRole("button", { name: "Return" }).click();
 
   await launch.click();
@@ -260,6 +261,37 @@ try {
     Math.abs(controlSnapshot?.playerForward?.[1] ?? 0) > 0.05,
     "pitch input did not change the ship's world-space flight direction",
   );
+  const beforeBoost = await page.evaluate(() =>
+    window.__rogueVectorQa?.snapshot(),
+  );
+  await page.keyboard.down("Shift");
+  await page.waitForFunction(
+    () => window.__rogueVectorQa?.snapshot().boostActive === true,
+  );
+  // The thrust ramp is damped, so let it spool before sampling velocity.
+  await page.waitForTimeout(400);
+  const duringBoost = await page.evaluate(() =>
+    window.__rogueVectorQa?.snapshot(),
+  );
+  assert.ok(
+    duringBoost.speed > beforeBoost.speed * 1.15,
+    `holding Shift did not accelerate the ship (${beforeBoost.speed} -> ${duringBoost.speed})`,
+  );
+  await page.keyboard.up("Shift");
+  await page.waitForFunction(
+    () => window.__rogueVectorQa?.snapshot().boostActive === false,
+  );
+
+  // Pin the burner down for a full minute of fixed-step updates. No single
+  // uninterrupted burn may exceed the ten-second reservoir.
+  const longestBurnSeconds = await page.evaluate(() =>
+    window.__rogueVectorQa?.boostForSteps(3600),
+  );
+  assert.ok(
+    longestBurnSeconds > 9.5 && longestBurnSeconds <= 10.0001,
+    `a continuous afterburner hold lasted ${longestBurnSeconds}s, expected a ~10s cap`,
+  );
+
   await page.keyboard.press("p");
   await page.locator(".perf-panel").waitFor({ state: "visible" });
   await page.waitForTimeout(1200);
@@ -359,6 +391,9 @@ try {
     fullTurnSnapshot,
     fullTurnDot,
     controlSnapshot,
+    beforeBoost,
+    duringBoost,
+    longestBurnSeconds,
     hudBeforeCamera,
     hudAfterCamera,
     qualityTransitions,
