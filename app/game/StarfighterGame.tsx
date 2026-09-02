@@ -198,6 +198,11 @@ const BOOST_RESPONSE = 4.5;
 const BOOST_FOV_KICK = 14;
 const BOOST_CHASE_PULLBACK = 16;
 const PLAYER_XWING_VISUAL_SCALE = 5;
+const SUN_DIRECTION = new THREE.Vector3(-180, 240, 160).normalize();
+const SUN_RENDER_DISTANCE = 1200;
+const SUN_SPRITE_DIAMETER = 400;
+const SUN_LIGHT_DISTANCE = 400;
+const SUN_SHADOW_EXTENT = 220;
 const SHIP_DISPLAY_SIZE: Record<ShipRole, number> = {
   player: 9.8 * PLAYER_XWING_VISUAL_SCALE,
   fighter: 6.2,
@@ -466,6 +471,32 @@ function makeGlowTexture() {
   return texture;
 }
 
+function makeSunTexture() {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  canvas.width = 128;
+  canvas.height = 128;
+
+  if (context) {
+    const gradient = context.createRadialGradient(64, 64, 0, 64, 64, 64);
+
+    gradient.addColorStop(0, "rgba(255,255,255,1)");
+    gradient.addColorStop(0.44, "rgba(255,246,222,1)");
+    gradient.addColorStop(0.58, "rgba(255,206,120,1)");
+    gradient.addColorStop(0.63, "rgba(255,150,54,.45)");
+    gradient.addColorStop(1, "rgba(255,96,16,0)");
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, 128, 128);
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+
+  texture.colorSpace = THREE.SRGBColorSpace;
+
+  return texture;
+}
+
 class SharedAssets {
   readonly box = new THREE.BoxGeometry(1, 1, 1);
   readonly playerHull = new THREE.MeshStandardMaterial({
@@ -481,12 +512,14 @@ class SharedAssets {
     emissiveIntensity: 0.8,
   });
   readonly glowTexture = makeGlowTexture();
+  readonly sunTexture = makeSunTexture();
 
   dispose() {
     this.box.dispose();
     this.playerHull.dispose();
     this.canopy.dispose();
     this.glowTexture.dispose();
+    this.sunTexture.dispose();
   }
 }
 
@@ -971,6 +1004,7 @@ class DogfightEngine {
   private player!: THREE.Group;
   private cockpit!: THREE.Group;
   private sun!: THREE.DirectionalLight;
+  private sunDisc!: THREE.Sprite;
   private stars!: THREE.Points;
   private asteroidMesh!: THREE.InstancedMesh;
   private playerLasers!: THREE.InstancedMesh;
@@ -1169,16 +1203,17 @@ class DogfightEngine {
   private buildWorld() {
     this.scene.add(new THREE.HemisphereLight(0x5d829d, 0x08090b, 1.4));
     this.sun = new THREE.DirectionalLight(0xd9efff, 3.2);
-    this.sun.position.set(-180, 240, 160);
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(1024, 1024);
-    this.sun.shadow.camera.near = 20;
-    this.sun.shadow.camera.far = 900;
-    this.sun.shadow.camera.left = -220;
-    this.sun.shadow.camera.right = 220;
-    this.sun.shadow.camera.top = 220;
-    this.sun.shadow.camera.bottom = -220;
-    this.scene.add(this.sun);
+    this.sun.shadow.camera.near = SUN_LIGHT_DISTANCE - SUN_SHADOW_EXTENT;
+    this.sun.shadow.camera.far = SUN_LIGHT_DISTANCE + SUN_SHADOW_EXTENT;
+    this.sun.shadow.camera.left = -SUN_SHADOW_EXTENT;
+    this.sun.shadow.camera.right = SUN_SHADOW_EXTENT;
+    this.sun.shadow.camera.top = SUN_SHADOW_EXTENT;
+    this.sun.shadow.camera.bottom = -SUN_SHADOW_EXTENT;
+    this.sun.shadow.camera.updateProjectionMatrix();
+    this.scene.add(this.sun, this.sun.target);
+    this.buildSunDisc();
 
     const rim = new THREE.PointLight(0x1b9ac4, 22, 700, 1.7);
     rim.position.set(260, -120, -300);
@@ -1199,6 +1234,32 @@ class DogfightEngine {
 
     this.camera.position.set(0, 4, 12);
     this.camera.lookAt(0, 0, -20);
+  }
+
+  private buildSunDisc() {
+    const material = new THREE.SpriteMaterial({
+      map: this.assets.sunTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+      toneMapped: false,
+    });
+
+    this.sunDisc = new THREE.Sprite(material);
+    this.sunDisc.scale.setScalar(SUN_SPRITE_DIAMETER);
+    this.scene.add(this.sunDisc);
+  }
+
+  private updateSunPlacement() {
+    this.sunDisc.position
+      .copy(this.camera.position)
+      .addScaledVector(SUN_DIRECTION, SUN_RENDER_DISTANCE);
+
+    this.sun.target.position.copy(this.camera.position);
+    this.sun.position
+      .copy(this.camera.position)
+      .addScaledVector(SUN_DIRECTION, SUN_LIGHT_DISTANCE);
   }
 
   private buildStars() {
@@ -1745,6 +1806,7 @@ class DogfightEngine {
     this.frameSampleTime += renderDelta;
 
     this.syncProjectileInstances();
+    this.updateSunPlacement();
     this.renderer.render(this.scene, this.camera);
 
     if (this.frameSampleTime >= 0.75) {
