@@ -1,28 +1,32 @@
 import assert from "node:assert/strict";
 import { access, readFile, stat } from "node:fs/promises";
+import http from "node:http";
 import test from "node:test";
+import next from "next";
 
 const projectRoot = new URL("../", import.meta.url);
 
 async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
+  const app = next({ dev: false, dir: projectRoot.pathname });
+  await app.prepare();
+  const handle = app.getRequestHandler();
 
-  return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => handle(req, res));
+    server.listen(0, async () => {
+      try {
+        const port = server.address().port;
+        const res = await fetch(`http://localhost:${port}/`, {
+          headers: { accept: "text/html" },
+        });
+        server.close();
+        resolve(res);
+      } catch (err) {
+        server.close();
+        reject(err);
+      }
+    });
+  });
 }
 
 test("server-renders the Rogue Vector loading shell", async () => {
