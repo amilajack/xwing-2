@@ -105,6 +105,22 @@ function gltfTransform(...arguments_) {
   });
 }
 
+/**
+ * The player model ships with its canopy hinged open.
+ *
+ * Seal it so the cockpit's closed.
+ */
+function closeCanopy(path) {
+  execFileSync(
+    process.execPath,
+    [join(projectRoot, "scripts", "close-x-wing-canopy.mjs"), path],
+    {
+      cwd: projectRoot,
+      stdio: "inherit",
+    },
+  );
+}
+
 function prepareStaticModel(input, output) {
   execFileSync(
     process.execPath,
@@ -209,6 +225,7 @@ try {
       "--effort",
       "85",
     );
+    if (asset.role === "player") closeCanopy(highPath);
     gltfTransform("validate", highPath);
 
     if (asset.low) {
@@ -250,6 +267,7 @@ try {
         "--effort",
         "75",
       );
+      if (asset.role === "player") closeCanopy(join(stagedModels, asset.low));
       gltfTransform("validate", join(stagedModels, asset.low));
     }
 
