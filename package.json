@@ -7,7 +7,7 @@
   },
   "scripts": {
     "assets:sketchfab": "node scripts/fetch-sketchfab-assets.mjs",
-    "dev": "next dev",
+    "dev": "next dev --webpack --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
