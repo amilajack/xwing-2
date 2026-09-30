@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  allowedDevOrigins: ["ubuntu24.taile96d94.ts.net"],
 };
 
 export default nextConfig;
