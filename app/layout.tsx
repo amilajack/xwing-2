@@ -1,7 +1,16 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { siteName } from "./site";
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  viewportFit: "cover",
+};
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -24,14 +33,22 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase: baseUrl,
-    title: "Rogue Vector",
+    title: siteName,
     description,
+    // Launched from the Home Screen, let the game draw under the status bar;
+    // the viewport already covers the notch and the controls keep clear of it.
+    appleWebApp: {
+      capable: true,
+      title: siteName,
+      statusBarStyle: "black-translucent",
+    },
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",
+      apple: "/apple-touch-icon.png",
     },
     openGraph: {
-      title: "Rogue Vector",
+      title: siteName,
       description,
       type: "website",
       url: baseUrl,
@@ -39,7 +56,7 @@ export async function generateMetadata(): Promise<Metadata> {
     },
     twitter: {
       card: "summary_large_image",
-      title: "Rogue Vector",
+      title: siteName,
       description,
       images: [new URL("/og.png", baseUrl)],
     },

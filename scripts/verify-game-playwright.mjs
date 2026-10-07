@@ -189,11 +189,52 @@ try {
   await page.getByRole("button", { name: "Controls" }).click();
   await page.getByText("Right click / Ctrl").waitFor();
   await page.getByText("Left click / Space").waitFor();
-  await page.getByText("Afterburner (hold, 10s)").first().waitFor();
+  await page.getByText("Shift (10s hold)").waitFor();
   await page.getByRole("button", { name: "Return" }).click();
 
   await launch.click();
   await page.locator(".hud").waitFor({ state: "visible" });
+  assert.equal(
+    await page.locator(".touch-overlay").count(),
+    0,
+    "desktop rendered touch controls",
+  );
+  await page.evaluate(() => {
+    window.__rogueVectorQa?.simulateGyro(45, 0);
+    for (let sample = 0; sample < 8; sample += 1) {
+      window.__rogueVectorQa?.simulateGyro(20, 12);
+    }
+  });
+  await page.getByText("PHONE / GYRO").waitFor();
+  const gyroSnapshot = await page.evaluate(() =>
+    window.__rogueVectorQa?.snapshot(),
+  );
+  assert.equal(gyroSnapshot?.touchDevice, false, "desktop was detected as touch");
+  assert.equal(gyroSnapshot?.gyro.baseline, true, "gyro baseline was not established");
+  assert.notEqual(gyroSnapshot?.gyro.y, 0, "synthetic pitch input was ignored");
+  await page.evaluate(() => {
+    for (let sample = 0; sample < 16; sample += 1) {
+      window.__rogueVectorQa?.simulateGyro(45, 0);
+    }
+  });
+  const neutralGyroSnapshot = await page.evaluate(() =>
+    window.__rogueVectorQa?.snapshot(),
+  );
+  assert.ok(
+    Math.abs(neutralGyroSnapshot?.gyro.y ?? 1) < Math.abs(gyroSnapshot?.gyro.y ?? 0),
+    "gyro pitch did not recover after returning to neutral",
+  );
+  await page.keyboard.press("Escape");
+  await page.getByRole("heading", { name: "Paused" }).waitFor();
+  await page.getByRole("button", { name: "Resume" }).click();
+  const resumedGyroSnapshot = await page.evaluate(() =>
+    window.__rogueVectorQa?.snapshot(),
+  );
+  assert.equal(
+    resumedGyroSnapshot?.gyro.baseline,
+    false,
+    "resume retained stale gyro calibration",
+  );
   const developmentPerf = page.locator(".development-r3f-perf");
   await developmentPerf.waitFor({ state: "visible" });
   await page.waitForTimeout(900);

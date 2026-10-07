@@ -1,8 +1,8 @@
 # Rogue Vector
 
-A desktop-only single-player Three.js/WebGL2 space dogfight. Fly an X-wing
-against TIE fighters, TIE interceptors, and stealth bombers through a dense
-asteroid field.
+A single-player Three.js/WebGL2 space dogfight. Fly an X-wing against TIE
+fighters, TIE interceptors, and stealth bombers through a dense asteroid field
+with keyboard, mouse, touch, or phone-tilt controls.
 
 ## Run locally
 
@@ -14,8 +14,28 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). Ultra is the default
-graphics preset. The game intentionally requires a modern desktop browser with
-WebGL2 and does not support mobile input.
+graphics preset. Phone motion controls require Safari permission and a secure
+context. iPhone Safari does not show the motion-permission prompt from a plain
+LAN `http://` URL, so serve the game over HTTPS, for example with Tailscale
+Serve:
+
+```bash
+# Terminal 1
+npm run build
+npm start
+
+# Terminal 2
+tailscale serve --bg 3000
+```
+
+Open the HTTPS address `tailscale serve` prints on the iPhone, tap **Launch fighter**,
+allow motion access, and calibrate the neutral phone position. The game asks
+for landscape orientation and displays a rotate prompt when the browser cannot
+lock orientation itself. For stable phone testing, use `npm start`; `npm run
+dev` enables Next.js HMR and can refresh Safari or Brave while the router is
+initializing. The development server also rejects hosts it does not know, so
+to use it through the tunnel, put that host in `ALLOWED_DEV_ORIGINS` in
+`.env.local`.
 
 Useful checks:
 
