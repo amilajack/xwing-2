@@ -6,7 +6,7 @@ import next from "next";
 
 const projectRoot = new URL("../", import.meta.url);
 
-async function render() {
+async function render(path = "/") {
   const app = next({ dev: false, dir: projectRoot.pathname });
   await app.prepare();
   const handle = app.getRequestHandler();
@@ -16,7 +16,7 @@ async function render() {
     server.listen(0, async () => {
       try {
         const port = server.address().port;
-        const res = await fetch(`http://localhost:${port}/`, {
+        const res = await fetch(`http://localhost:${port}${path}`, {
           headers: { accept: "text/html" },
         });
         server.close();
@@ -42,8 +42,27 @@ test("server-renders the Rogue Vector loading shell", async () => {
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });
 
+test("can be added to the iPhone Home Screen and launched without Safari's bars", async () => {
+  const html = await (await render()).text();
+  const manifestHref = html.match(/<link rel="manifest" href="([^"]+)"/)?.[1];
+  const iconHref = html.match(/<link rel="apple-touch-icon" href="([^"]+)"/)?.[1];
+  assert.ok(manifestHref, "the page must link a web app manifest");
+  assert.ok(iconHref, "iOS uses apple-touch-icon for the Home Screen icon");
+  // black-translucent lets the game draw under the status bar once installed.
+  assert.match(html, /name="apple-mobile-web-app-status-bar-style" content="black-translucent"/);
+
+  const manifest = await (await render(manifestHref)).json();
+  // iOS Safari honours "standalone" and ignores "fullscreen".
+  assert.equal(manifest.display, "standalone");
+  assert.ok(manifest.name, "the Home Screen needs a name to show");
+
+  const icon = await render(iconHref);
+  assert.equal(icon.status, 200);
+  assert.match(icon.headers.get("content-type") ?? "", /^image\/png\b/);
+});
+
 test("keeps performance-critical systems explicit and bounded", async () => {
-  const [source, importer, page, layout, globalCss, packageJson] =
+  const [source, importer, page, site, globalCss, packageJson] =
     await Promise.all([
       readFile(
         new URL("../app/game/StarfighterGame.tsx", import.meta.url),
@@ -54,7 +73,7 @@ test("keeps performance-critical systems explicit and bounded", async () => {
         "utf8",
       ),
       readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-      readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+      readFile(new URL("../app/site.ts", import.meta.url), "utf8"),
       readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
       readFile(new URL("../package.json", import.meta.url), "utf8"),
     ]);
@@ -94,9 +113,10 @@ test("keeps performance-critical systems explicit and bounded", async () => {
   assert.match(source, /document\.hidden/);
   assert.match(source, /dispose\(\)/);
   assert.match(page, /StarfighterGame/);
-  assert.match(layout, /Rogue Vector/);
-  assert.match(globalCss, /width: 100dvw/);
-  assert.match(globalCss, /height: 100dvh/);
+  assert.match(site, /Rogue Vector/);
+  // The shell follows the visual viewport, so browser chrome cannot cover it.
+  assert.match(globalCss, /top: var\(--viewport-offset-top/);
+  assert.match(globalCss, /height: var\(--viewport-height/);
   assert.match(packageJson, /"three":/);
   assert.match(packageJson, /"@react-three\/fiber":/);
   assert.match(packageJson, /"r3f-perf":/);

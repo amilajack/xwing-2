@@ -11,6 +11,10 @@
   --line: rgba(125, 221, 242, 0.24);
   --font-ui: var(--font-geist-sans), system-ui, sans-serif;
   --font-data: var(--font-geist-mono), ui-monospace, monospace;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
 }
 
 * {
@@ -40,9 +44,10 @@ button {
 
 .game-shell {
   position: fixed;
-  inset: 0;
-  width: 100dvw;
-  height: 100dvh;
+  top: var(--viewport-offset-top, 0px);
+  left: var(--viewport-offset-left, 0px);
+  width: var(--viewport-width, 100vw);
+  height: var(--viewport-height, 100svh);
   overflow: hidden;
   isolation: isolate;
   background:
@@ -54,8 +59,8 @@ button {
   display: block;
   position: absolute;
   inset: 0;
-  width: 100dvw;
-  height: 100dvh;
+  width: 100%;
+  height: 100%;
   max-width: none;
   max-height: none;
   outline: none;
@@ -64,6 +69,34 @@ button {
 
 .game-canvas.is-paused {
   cursor: default;
+}
+
+.orientation-gate {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(1, 4, 10, 0.94);
+}
+
+.orientation-card {
+  width: min(360px, 100%);
+  padding: 28px 24px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  text-align: center;
+}
+
+.orientation-card h2 {
+  margin: 12px 0 8px;
+  font-size: clamp(20px, 6vw, 28px);
+}
+
+.orientation-card p {
+  margin: 0;
+  color: var(--muted);
 }
 
 .vignette,
@@ -115,7 +148,7 @@ button {
 
 .hud-top {
   position: absolute;
-  top: 24px;
+  top: calc(24px + var(--safe-top));
   left: 50%;
   display: flex;
   align-items: stretch;
@@ -197,13 +230,11 @@ button {
     box-shadow: 0 0 22px var(--bar, var(--cyan));
   }
 }
-
 @media (prefers-reduced-motion: reduce) {
   .meter-active > span {
     animation: none;
   }
 }
-
 .radar {
   position: absolute;
   right: 28px;
@@ -671,7 +702,6 @@ button {
     opacity: 0.35;
   }
 }
-
 @media (max-width: 760px) {
   .hud-top {
     top: 14px;
@@ -698,6 +728,264 @@ button {
 
   .settings-grid,
   .controls-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (orientation: landscape) and (max-height: 600px) {
+  .overlay {
+    padding: max(12px, var(--safe-top))
+      max(16px, var(--safe-right))
+      max(12px, var(--safe-bottom))
+      max(16px, var(--safe-left));
+  }
+
+  .menu {
+    width: min(880px, 100%);
+    min-height: 0;
+    max-height: 100%;
+    padding: 28px 32px 24px;
+  }
+
+  .menu h1 {
+    margin: 8px 0 6px;
+    font-size: clamp(38px, 10vh, 58px);
+  }
+
+  .menu-copy {
+    max-width: 620px;
+    margin: 12px 0 14px;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .threat-row {
+    gap: 6px;
+    margin-bottom: 16px;
+  }
+
+  .threat-chip {
+    padding: 5px 8px;
+    font-size: 9px;
+  }
+
+  .menu-actions {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .primary-btn,
+  .secondary-btn {
+    padding-block: 10px;
+  }
+
+  .primary-btn {
+    min-width: 168px;
+  }
+
+  .menu-footer {
+    display: none;
+  }
+}
+
+/* Controls Grid 3 Columns */
+.controls-card-wide {
+  width: min(840px, 94vw);
+}
+
+.controls-grid-3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+/* On-Screen Mobile Touch Overlay */
+/* On touch screens the
+bottom corners belong to the
+thumbs - BOOST and FIRE
+  sit there - so the readouts
+  that normally live there
+  move up the sides. */
+.hud.is-touch .status-stack {
+  top: calc(84px + var(--safe-top));
+  bottom: auto;
+  left: calc(24px + var(--safe-left));
+}
+
+.hud.is-touch .radar {
+  top: calc(18px + var(--safe-top));
+  bottom: auto;
+  right: calc(24px + var(--safe-right));
+}
+
+/* The CAM button already
+names the camera, and the
+input is the phone. */
+.hud.is-touch .camera-mode {
+  display: none;
+}
+
+.hud.is-touch .radar-label {
+  top: calc(176px + var(--safe-top));
+  bottom: auto;
+  right: calc(40px + var(--safe-right));
+}
+
+.touch-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 8;
+}
+
+.touch-top-bar {
+  position: absolute;
+  top: calc(18px + var(--safe-top));
+  left: calc(24px + var(--safe-left));
+  display: flex;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.touch-motion-status {
+  align-self: center;
+  color: #9bb8c2;
+  font: 700 10px var(--font-data);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.touch-left-cluster {
+  position: absolute;
+  left: calc(24px + var(--safe-left));
+  bottom: calc(24px + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.touch-right-cluster {
+  position: absolute;
+  right: calc(24px + var(--safe-right));
+  bottom: calc(24px + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  pointer-events: auto;
+}
+
+.touch-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(114, 233, 255, 0.35);
+  background: rgba(3, 16, 25, 0.72);
+  backdrop-filter: blur(8px);
+  color: var(--cyan-bright);
+  font: 700 11px var(--font-data);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+  transition: background 120ms ease, border-color 120ms ease, transform 80ms ease;
+}
+
+.touch-btn:active,
+.touch-btn.active {
+  background: rgba(114, 233, 255, 0.3);
+  border-color: var(--cyan-bright);
+  box-shadow: 0 0 20px rgba(114, 233, 255, 0.45);
+  transform: scale(0.96);
+}
+
+.touch-btn-util {
+  padding: 8px 14px;
+  border-radius: 4px;
+  font-size: 10px;
+}
+
+/* One shape for both thumbs,
+so the corners mirror each
+other; color tells them apart. */
+.touch-btn-boost,
+.touch-btn-fire {
+  min-width: 120px;
+  height: 90px;
+  border-radius: 12px;
+  font-size: 14px;
+}
+
+.touch-btn-fire {
+  border-color: rgba(255, 92, 85, 0.5);
+  color: #ff9b94;
+  background: rgba(45, 12, 10, 0.75);
+}
+
+.touch-btn-fire:active,
+.touch-btn-fire.active {
+  background: rgba(255, 92, 85, 0.4);
+  border-color: var(--red);
+  box-shadow: 0 0 24px rgba(255, 92, 85, 0.5);
+}
+
+/* Mobile Guide Card Modal */
+.mobile-guide-card {
+  width: min(580px, 92vw);
+  text-align: left;
+}
+
+.mobile-guide-content {
+  margin: 18px 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.mobile-guide-steps {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #a3c1cf;
+}
+
+.mobile-guide-steps code {
+  color: var(--cyan-bright);
+  background: rgba(114, 233, 255, 0.12);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.mobile-summary-box {
+  padding: 14px 16px;
+  border: 1px solid rgba(114, 233, 255, 0.2);
+  background: rgba(7, 25, 34, 0.6);
+  border-radius: 4px;
+}
+
+.mobile-summary-box h4 {
+  margin: 0 0 8px;
+  color: var(--cyan-bright);
+  font: 600 11px var(--font-data);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.mobile-summary-box ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #8bb0c0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+@media (max-width: 900px) {
+  .controls-grid-3 {
     grid-template-columns: 1fr;
   }
 }

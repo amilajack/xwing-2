@@ -16,18 +16,23 @@ import {
   type GLProps,
 } from "@react-three/fiber";
 import * as THREE from "three";
+import { deviceTiltFromOrientation, type DeviceTilt } from "./deviceTilt";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 declare global {
   interface Window {
     __rogueVectorQa?: {
       stageFleet: () => void;
+      simulateGyro: (beta: number, gamma: number) => void;
       steerForSteps: (steerX: number, steerY: number, steps: number) => void;
       boostForSteps: (steps: number) => number;
       snapshot: () => {
         status: GameStatus;
         quality: QualityName;
         detail: "high" | "low";
+        touchDevice: boolean;
+        gyroPermission: GyroPermissionState;
+        gyro: { x: number; y: number; baseline: boolean };
         activeEnemies: Record<EnemyKind, number>;
         activeProjectiles: number;
         speed: number;
@@ -56,6 +61,37 @@ type GameStatus =
   | "asseterror";
 type QualityName = "low" | "medium" | "high" | "ultra" | "custom";
 type EnemyKind = "fighter" | "interceptor" | "bomber";
+type GyroPermissionState =
+  | "unavailable"
+  | "prompt"
+  | "requesting"
+  | "granted"
+  | "denied";
+type WakeLockHandle = { release: () => Promise<void> };
+type WakeLockManager = {
+  request: (type: "screen") => Promise<WakeLockHandle>;
+};
+
+function isWakeLockManager(value: unknown): value is WakeLockManager {
+  if (typeof value !== "object" || value === null) return false;
+  return "request" in value && typeof value.request === "function";
+}
+type MotionPermissionRequest = () => Promise<"granted" | "denied">;
+type OrientationLockRequest = (
+  orientation: "any" | "natural" | "landscape" | "portrait",
+) => Promise<void>;
+
+function isMotionPermissionRequest(
+  value: unknown,
+): value is MotionPermissionRequest {
+  return typeof value === "function";
+}
+
+function isOrientationLockRequest(
+  value: unknown,
+): value is OrientationLockRequest {
+  return typeof value === "function";
+}
 
 type GraphicsSettings = {
   quality: QualityName;
@@ -104,7 +140,19 @@ type HudSnapshot = {
   triangles: number;
   renderScale: number;
   diagnostics: boolean;
-  input: "KEYBOARD + MOUSE" | "GAMEPAD";
+  input: "KEYBOARD + MOUSE" | "GAMEPAD" | "PHONE / GYRO" | "TOUCH";
+  sideways: boolean;
+  rawGyroX: number;
+  rawGyroY: number;
+  isTouchDevice: boolean;
+  gyroPermission: GyroPermissionState;
+  onFireStart?: () => void;
+  onFireEnd?: () => void;
+  onBoostStart?: () => void;
+  onBoostEnd?: () => void;
+  onToggleSideways?: () => void;
+  onToggleCamera?: () => void;
+  onCalibrateGyro?: () => void;
 };
 
 const QUALITY_PRESETS: Record<Exclude<QualityName, "custom">, GraphicsSettings> =
@@ -171,22 +219,32 @@ const DEFAULT_SETTINGS = QUALITY_PRESETS.ultra;
 const SETTINGS_KEY = "rogue-vector-settings-v2";
 const SCORE_KEY = "rogue-vector-high-score";
 const IS_DEVELOPMENT = process.env.NODE_ENV === "development";
-const DevelopmentPerf = IS_DEVELOPMENT
-  ? lazy(() =>
-      import("r3f-perf").then(({ Perf }) => ({
-        default: Perf,
-      })),
-    )
-  : null;
+const DevelopmentPerf =
+  IS_DEVELOPMENT && typeof window !== "undefined"
+    ? lazy(() =>
+        import("r3f-perf").then(({ Perf }) => ({
+          default: Perf,
+        })),
+      )
+    : null;
 const FIXED_STEP = 1 / 60;
 const MAX_ENEMIES = 20;
 const MAX_PROJECTILES = 320;
 const MAX_EXPLOSIONS = 32;
 const LOCAL_FORWARD = new THREE.Vector3(0, 0, -1);
+/** Roll axis, pointing back down the fuselage: +Z rolls the left wing down. */
+const LOCAL_ROLL_AXIS = new THREE.Vector3(0, 0, 1);
 const REFERENCE_SPEED_SCALE = 17.5;
 const MAX_PITCH_RATE = THREE.MathUtils.degToRad(78);
 const MAX_YAW_RATE = THREE.MathUtils.degToRad(92);
 const FLIGHT_CONTROL_RESPONSE = 7;
+// How far the ship lays over at full stick or mouse deflection. A phone
+// needs no such scale: the ship copies the phone's own roll, angle for angle.
+// The bank is a visual answer to the input, not an aerodynamic one: it rolls
+// the model inside the flight frame rather than rolling the frame itself, so
+// a banked ship still pitches and yaws along the axes the player aimed it at.
+const MAX_BANK_ROLL = THREE.MathUtils.degToRad(55);
+const BANK_ROLL_RESPONSE = 5;
 const ARENA_HALF_EXTENT = 700;
 // The afterburner reservoir holds ten seconds of thrust. It only refills while
 // the burner is off, so a single hold can never exceed BOOST_MAX_SECONDS.
@@ -264,6 +322,11 @@ const EMPTY_HUD: HudSnapshot = {
   renderScale: 1,
   diagnostics: false,
   input: "KEYBOARD + MOUSE",
+  sideways: false,
+  rawGyroX: 0,
+  rawGyroY: 0,
+  isTouchDevice: false,
+  gyroPermission: "unavailable",
 };
 
 function loadSettings(): GraphicsSettings {
@@ -287,6 +350,19 @@ function loadHighScore() {
   }
 }
 
+function requestLandscapeLock() {
+  if (typeof window === "undefined") return;
+  const orientation = window.screen.orientation;
+  const lockCandidate = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(orientation),
+    "lock",
+  )?.value;
+  if (!isOrientationLockRequest(lockCandidate)) return;
+  void lockCandidate.call(orientation, "landscape").catch((error: unknown) => {
+    console.debug("Landscape orientation lock is unavailable", error);
+  });
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
@@ -308,9 +384,9 @@ function deadzone(value: number, zone = 0.12) {
   return Math.sign(value) * ((abs - zone) / (1 - zone));
 }
 
-async function loadShipModelLibrary(): Promise<ShipModelLibrary> {
+async function loadShipModelLibrary(isTouchDevice: boolean): Promise<ShipModelLibrary> {
   const loader = new GLTFLoader();
-  const load = async (path: string, role: ShipRole) => {
+  const loadUncached = async (path: string, role: ShipRole) => {
     const gltf = await loader.loadAsync(path);
     const scene = gltf.scene;
     const nonVisualNodes: THREE.Object3D[] = [];
@@ -355,6 +431,14 @@ async function loadShipModelLibrary(): Promise<ShipModelLibrary> {
     gameRoot.add(normalization);
     return gameRoot;
   };
+  const loadedModels = new Map<string, Promise<THREE.Group>>();
+  const load = (path: string, role: ShipRole) => {
+    const existing = loadedModels.get(`${role}:${path}`);
+    if (existing) return existing;
+    const model = loadUncached(path, role);
+    loadedModels.set(`${role}:${path}`, model);
+    return model;
+  };
 
   const [
     playerHigh,
@@ -367,13 +451,13 @@ async function loadShipModelLibrary(): Promise<ShipModelLibrary> {
     bomberLow,
     asteroidScene,
   ] = await Promise.all([
-    load("/models/xwing-high.glb", "player"),
+    load(isTouchDevice ? "/models/xwing-low.glb" : "/models/xwing-high.glb", "player"),
     load("/models/xwing-low.glb", "player"),
-    load("/models/tie-fighter-high.glb", "fighter"),
+    load(isTouchDevice ? "/models/tie-fighter-low.glb" : "/models/tie-fighter-high.glb", "fighter"),
     load("/models/tie-fighter-low.glb", "fighter"),
-    load("/models/tie-interceptor-high.glb", "interceptor"),
+    load(isTouchDevice ? "/models/tie-interceptor-low.glb" : "/models/tie-interceptor-high.glb", "interceptor"),
     load("/models/tie-interceptor-low.glb", "interceptor"),
-    load("/models/stealth-bomber-high.glb", "bomber"),
+    load(isTouchDevice ? "/models/stealth-bomber-low.glb" : "/models/stealth-bomber-high.glb", "bomber"),
     load("/models/stealth-bomber-low.glb", "bomber"),
     loader.loadAsync("/models/asteroid-high.glb").then((gltf) => gltf.scene),
   ]);
@@ -1002,6 +1086,11 @@ class DogfightEngine {
   private readonly renderer: THREE.WebGLRenderer;
   private resizeObserver?: ResizeObserver;
   private player!: THREE.Group;
+  /** The visible ship, banked inside the flight frame. */
+  private playerModel!: THREE.Group;
+  private bankRoll = 0;
+  /** The phone's roll from its calibrated neutral, as the bank that copies it. */
+  private phoneBankRoll = 0;
   private cockpit!: THREE.Group;
   private sun!: THREE.DirectionalLight;
   private sunDisc!: THREE.Sprite;
@@ -1022,6 +1111,20 @@ class DogfightEngine {
   private mouseXPercent = 0;
   private mouseYPercent = 0;
   private mouseFire = false;
+  private touchFire = false;
+  private touchBoost = false;
+  private touchSteeringActive = false;
+  private gyroPermission: GyroPermissionState = "prompt";
+  private gyroPermissionRequest?: Promise<boolean>;
+  private gyroBaseline: DeviceTilt = { pitch: 0, roll: 0 };
+  private gyroHasBaseline = false;
+  private rawGyroX = 0;
+  private rawGyroY = 0;
+  private gyroScreenAngle?: number;
+  private gyroFilteredX = 0;
+  private gyroFilteredY = 0;
+  private wakeLock?: WakeLockHandle;
+  private isTouchDevice = false;
   private sideways = false;
   private sidewaysRotation = 0;
   private sidewaysStartRotation = 0;
@@ -1096,10 +1199,10 @@ class DogfightEngine {
     this.camera.updateProjectionMatrix();
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
-    this.renderer.setClearColor(0x01040a, 1);
+    this.renderer.toneMappingExposure = 1.45;
+    this.renderer.setClearColor(0x030b14, 1);
     this.renderer.info.autoReset = !IS_DEVELOPMENT;
-    this.scene.fog = new THREE.FogExp2(0x020710, 0.00075);
+    this.scene.fog = new THREE.FogExp2(0x06111d, 0.00052);
 
     this.buildWorld();
     this.bindEvents();
@@ -1112,7 +1215,15 @@ class DogfightEngine {
     if (!new URLSearchParams(window.location.search).has("qa")) return;
     window.__rogueVectorQa = {
       stageFleet: () => this.stageFleetInspection(),
+      simulateGyro: (beta, gamma) => {
+        this.gyroPermission = "granted";
+        this.onDeviceOrientation(
+          new DeviceOrientationEvent("deviceorientation", { beta, gamma }),
+        );
+      },
       steerForSteps: (steerX, steerY, steps) => {
+        // Stands in for stick or mouse steering, as a real mouse move would.
+        this.activeInput = "KEYBOARD + MOUSE";
         this.mouseXPercent = clamp(steerX, -1, 1);
         this.mouseYPercent = clamp(steerY, -1, 1);
         const boundedSteps = clamp(Math.floor(steps), 1, 360);
@@ -1144,11 +1255,34 @@ class DogfightEngine {
         }
         const playerForward = this.tempV1
           .copy(LOCAL_FORWARD)
-          .applyQuaternion(this.player.quaternion);
+          .applyQuaternion(this.player.quaternion)
+          .toArray();
+        const playerRight = this.tempV1
+          .set(1, 0, 0)
+          .applyQuaternion(this.player.quaternion)
+          .toArray();
+        const playerUp = this.tempV1
+          .set(0, 1, 0)
+          .applyQuaternion(this.player.quaternion)
+          .toArray();
+        // The ship's own up vector, bank included, against the flight frame's
+        // right: it leans one way or the other only when the model is banked.
+        const shipUpDotFrameRight = this.tempV1
+          .set(0, 1, 0)
+          .applyEuler(this.playerModel.rotation)
+          .applyQuaternion(this.player.quaternion)
+          .dot(this.tempV2.fromArray(playerRight));
         return {
           status: this.status,
           quality: this.settings.quality,
           detail: this.modelDetail,
+          touchDevice: this.isTouchDevice,
+          gyroPermission: this.gyroPermission,
+          gyro: {
+            x: this.rawGyroX,
+            y: this.rawGyroY,
+            baseline: this.gyroHasBaseline,
+          },
           activeEnemies,
           activeProjectiles: this.projectiles.filter(
             (projectile) => projectile.active,
@@ -1157,8 +1291,13 @@ class DogfightEngine {
           boostActive: this.boostActive,
           boostRemaining: this.boostRemaining,
           sideways: this.sideways,
+          bankRoll: this.bankRoll,
+          phoneBankRoll: this.phoneBankRoll,
+          shipUpDotFrameRight,
           playerPosition: this.player.position.toArray(),
-          playerForward: playerForward.toArray(),
+          playerForward,
+          playerRight,
+          playerUp,
           viewport: {
             width: this.canvas.clientWidth,
             height: this.canvas.clientHeight,
@@ -1201,8 +1340,9 @@ class DogfightEngine {
   }
 
   private buildWorld() {
-    this.scene.add(new THREE.HemisphereLight(0x5d829d, 0x08090b, 1.4));
-    this.sun = new THREE.DirectionalLight(0xd9efff, 3.2);
+    this.scene.add(new THREE.AmbientLight(0xffffff, 1.15));
+    this.scene.add(new THREE.HemisphereLight(0x82b9d3, 0x172331, 2.2));
+    this.sun = new THREE.DirectionalLight(0xe5f5ff, 4.2);
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(1024, 1024);
     this.sun.shadow.camera.near = SUN_LIGHT_DISTANCE - SUN_SHADOW_EXTENT;
@@ -1222,7 +1362,11 @@ class DogfightEngine {
     this.buildStars();
     this.buildAsteroids();
 
-    this.player = this.cloneShipModel("player");
+    this.player = new THREE.Group();
+    this.player.name = "player-flight-frame";
+    this.playerModel = this.cloneShipModel("player");
+    this.player.add(this.playerModel);
+    this.player.add(new THREE.PointLight(0xb9eaff, 7, 42, 2));
     this.scene.add(this.player);
     this.cockpit = createCockpitRig(this.assets);
     this.camera.add(this.cockpit);
@@ -1385,13 +1529,11 @@ class DogfightEngine {
     if (detail === this.modelDetail || !this.player) return;
     this.modelDetail = detail;
 
-    const nextPlayer = this.cloneShipModel("player");
-    nextPlayer.position.copy(this.player.position);
-    nextPlayer.quaternion.copy(this.player.quaternion);
-    nextPlayer.visible = this.player.visible;
-    this.scene.remove(this.player);
-    this.player = nextPlayer;
-    this.scene.add(this.player);
+    const nextModel = this.cloneShipModel("player");
+    nextModel.rotation.z = this.playerModel.rotation.z;
+    this.player.remove(this.playerModel);
+    this.playerModel = nextModel;
+    this.player.add(this.playerModel);
 
     for (const enemy of this.enemies) {
       const nextGroup = this.cloneShipModel(enemy.kind);
@@ -1466,11 +1608,20 @@ class DogfightEngine {
   }
 
   private bindEvents() {
+    this.isTouchDevice =
+      typeof window !== "undefined" &&
+      ("ontouchstart" in window || navigator.maxTouchPoints > 0);
+    if (!this.isTouchDevice) this.gyroPermission = "unavailable";
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
     window.addEventListener("blur", this.onBlur);
     window.addEventListener("mousemove", this.onMouseMove);
     window.addEventListener("mouseup", this.onCanvasMouseUp);
+    window.addEventListener("deviceorientation", this.onDeviceOrientation);
+    window.addEventListener("orientationchange", this.onScreenOrientationChange);
+    window.addEventListener("touchstart", this.onTouchStart, { passive: true });
+    window.addEventListener("touchmove", this.onTouchMove, { passive: true });
+    window.addEventListener("touchend", this.onTouchEnd);
     window.addEventListener("resize", this.resize, { passive: true });
     window.visualViewport?.addEventListener("resize", this.resize, {
       passive: true,
@@ -1481,6 +1632,157 @@ class DogfightEngine {
     this.resizeObserver = new ResizeObserver(this.resize);
     this.resizeObserver.observe(this.canvas);
   }
+
+  private onDeviceOrientation = (event: DeviceOrientationEvent) => {
+    if (this.status !== "playing") return;
+
+    const screenAngle =
+      ((window.screen?.orientation?.angle ?? 0) % 360 + 360) % 360;
+    // A baseline captured in one screen orientation is meaningless in another.
+    if (this.gyroScreenAngle !== screenAngle) {
+      this.gyroScreenAngle = screenAngle;
+      this.gyroHasBaseline = false;
+    }
+
+    const tilt = deviceTiltFromOrientation(
+      event.beta ?? 0,
+      event.gamma ?? 0,
+      screenAngle,
+    );
+    if (!this.gyroHasBaseline) {
+      this.gyroBaseline = tilt;
+      this.gyroHasBaseline = true;
+      return;
+    }
+
+    const maxTiltDeg = 25;
+    // Wrapped so a neutral near ±180° cannot read as a full turn.
+    const rollDegrees =
+      ((tilt.roll - this.gyroBaseline.roll + 540) % 360) - 180;
+    const targetGyroX = clamp(rollDegrees / maxTiltDeg, -1, 1);
+    const targetGyroY = clamp(
+      (tilt.pitch - this.gyroBaseline.pitch) / maxTiltDeg,
+      -1,
+      1,
+    );
+    // Both axes share one smoothing constant: an axis that responds faster
+    // than the other reads as cross-axis coupling even when the mapping is
+    // clean, because the quicker axis is the one the player notices.
+    const smoothing = 0.18;
+    this.gyroFilteredX += (targetGyroX - this.gyroFilteredX) * smoothing;
+    this.gyroFilteredY += (targetGyroY - this.gyroFilteredY) * smoothing;
+    // Same smoothing again, so the bank and the turn it belongs to move as one.
+    this.phoneBankRoll +=
+      (-THREE.MathUtils.degToRad(rollDegrees) - this.phoneBankRoll) * smoothing;
+    this.rawGyroX = this.gyroFilteredX;
+    this.rawGyroY = this.gyroFilteredY;
+
+    if (this.gyroPermission === "granted") {
+      this.activeInput = "PHONE / GYRO";
+      this.touchSteeringActive = false;
+      this.mouseXPercent = deadzone(this.rawGyroX, 0.04);
+      this.mouseYPercent = deadzone(-this.rawGyroY, 0.04);
+    }
+  };
+
+  private onScreenOrientationChange = () => {
+    this.calibrateGyro();
+  };
+
+  private onTouchStart = (event: TouchEvent) => {
+    if (this.status === "playing" && this.gyroPermission === "prompt") {
+      this.requestGyroPermission();
+    }
+    this.touchSteeringActive =
+      !(event.target instanceof Element && event.target.closest(".touch-btn"));
+  };
+
+  private onTouchMove = (event: TouchEvent) => {
+    if (this.status !== "playing") return;
+    if (!this.touchSteeringActive || this.gyroPermission === "granted") return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    if (event.target instanceof Element && event.target.closest(".touch-btn")) {
+      return;
+    }
+    const halfWidth = window.innerWidth / 2;
+    const halfHeight = window.innerHeight / 2;
+    this.mouseXPercent = clamp(
+      ((touch.clientX - halfWidth) / (window.innerWidth / 2.3)) *
+        this.settings.sensitivity,
+      -1,
+      1,
+    );
+    this.mouseYPercent = clamp(
+      ((touch.clientY - halfHeight) / (window.innerHeight / 2.3)) *
+        this.settings.sensitivity *
+        (this.settings.invertY ? -1 : 1),
+      -1,
+      1,
+    );
+    this.activeInput = "TOUCH";
+  };
+
+  private onTouchEnd = (event: TouchEvent) => {
+    if (event.touches.length > 0) return;
+    if (this.gyroPermission !== "granted") {
+      this.mouseXPercent = 0;
+      this.mouseYPercent = 0;
+    }
+    this.touchSteeringActive = false;
+  };
+
+  public calibrateGyro = () => {
+    this.gyroHasBaseline = false;
+    this.gyroScreenAngle = undefined;
+    this.gyroFilteredX = 0;
+    this.gyroFilteredY = 0;
+    this.phoneBankRoll = 0;
+    this.rawGyroX = 0;
+    this.rawGyroY = 0;
+  };
+
+  public async requestGyroPermission(): Promise<boolean> {
+    if (this.gyroPermission === "granted") return true;
+    if (this.gyroPermissionRequest) return this.gyroPermissionRequest;
+    const requestPermissionCandidate: unknown =
+      Object.getOwnPropertyDescriptor(DeviceOrientationEvent, "requestPermission")
+        ?.value;
+    if (!isMotionPermissionRequest(requestPermissionCandidate)) {
+      this.gyroPermission = "granted";
+      this.calibrateGyro();
+      return true;
+    }
+
+    this.gyroPermission = "requesting";
+    const permissionRequest = requestPermissionCandidate()
+      .then((state) => {
+        const granted = state === "granted";
+        this.gyroPermission = granted ? "granted" : "denied";
+        if (granted) this.calibrateGyro();
+        return granted;
+      })
+      .catch((error: unknown) => {
+        console.error("Unable to request device orientation permission", error);
+        this.gyroPermission = "denied";
+        return false;
+      })
+      .finally(() => {
+        this.gyroPermissionRequest = undefined;
+      });
+    this.gyroPermissionRequest = permissionRequest;
+    return permissionRequest;
+  }
+
+  public setTouchFire = (active: boolean) => {
+    this.touchFire = active;
+    if (active) this.activeInput = "TOUCH";
+  };
+
+  public setTouchBoost = (active: boolean) => {
+    this.touchBoost = active;
+    if (active) this.activeInput = "TOUCH";
+  };
 
   private onKeyDown = (event: KeyboardEvent) => {
     this.keys.add(event.code);
@@ -1515,6 +1817,8 @@ class DogfightEngine {
   // afterburner held down and silently drain the reservoir.
   private onBlur = () => {
     this.keys.clear();
+    this.touchFire = false;
+    this.touchBoost = false;
   };
 
   private onMouseMove = (event: MouseEvent) => {
@@ -1540,7 +1844,16 @@ class DogfightEngine {
 
   private onVisibility = () => {
     if (document.hidden && this.status === "playing") this.pause();
+    if (!document.hidden && this.status === "paused") this.resetFlightInput();
+    if (!document.hidden && this.status === "playing") this.requestWakeLock();
   };
+
+  private resetFlightInput() {
+    this.mouseXPercent = 0;
+    this.mouseYPercent = 0;
+    this.touchSteeringActive = false;
+    this.calibrateGyro();
+  }
 
   private onCanvasMouseDown = (event: MouseEvent) => {
     event.preventDefault();
@@ -1577,15 +1890,21 @@ class DogfightEngine {
       settings.renderScale,
     );
     if (this.asteroidMesh) {
-      this.asteroidMesh.count = settings.asteroidCount;
-      this.asteroidMesh.castShadow = settings.shadows;
+      this.asteroidMesh.count = Math.min(
+        settings.asteroidCount,
+        this.isTouchDevice ? 320 : settings.asteroidCount,
+      );
+      this.asteroidMesh.castShadow = settings.shadows && !this.isTouchDevice;
       this.rebuildAsteroidGrid();
     }
-    this.stars?.geometry.setDrawRange(0, settings.starCount);
+    this.stars?.geometry.setDrawRange(
+      0,
+      Math.min(settings.starCount, this.isTouchDevice ? 3500 : settings.starCount),
+    );
     if (this.renderer) {
-      this.renderer.shadowMap.enabled = settings.shadows;
+      this.renderer.shadowMap.enabled = settings.shadows && !this.isTouchDevice;
       this.renderer.shadowMap.type = THREE.PCFShadowMap;
-      this.sun.castShadow = settings.shadows;
+      this.sun.castShadow = settings.shadows && !this.isTouchDevice;
       this.updateRendererResolution();
     }
   }
@@ -1595,7 +1914,11 @@ class DogfightEngine {
     height = Math.max(1, Math.round(this.canvas.getBoundingClientRect().height)),
   ) {
     if (!this.renderer) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, this.settings.maxDpr);
+    const dpr = Math.min(
+      window.devicePixelRatio || 1,
+      this.settings.maxDpr,
+      this.isTouchDevice ? 1.25 : this.settings.maxDpr,
+    );
     const pixelRatio = dpr * this.effectiveScale;
     if (Math.abs(this.renderer.getPixelRatio() - pixelRatio) > 0.001) {
       this.renderer.setPixelRatio(pixelRatio);
@@ -1607,9 +1930,11 @@ class DogfightEngine {
   }
 
   begin() {
+    this.resetFlightInput();
     this.resetGame();
     this.audio.ensure();
     this.audio.setMuted(this.settings.muted);
+    this.requestWakeLock();
     this.setStatus("playing");
   }
 
@@ -1620,6 +1945,7 @@ class DogfightEngine {
   pause() {
     if (this.status !== "playing") return;
     this.audio.suspend();
+    this.releaseWakeLock();
     this.setStatus("paused");
   }
 
@@ -1627,7 +1953,41 @@ class DogfightEngine {
     if (this.status !== "paused") return;
     this.audio.ensure();
     this.accumulator = 0;
+    this.resetFlightInput();
+    this.requestWakeLock();
     this.setStatus("playing");
+  }
+
+  private requestWakeLock() {
+    if (this.wakeLock || typeof navigator === "undefined") return;
+    const wakeLockCandidate = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(navigator),
+      "wakeLock",
+    )?.get?.call(navigator);
+    if (!isWakeLockManager(wakeLockCandidate)) return;
+    void wakeLockCandidate
+      .request("screen")
+      .then((handle) => {
+        if (this.status === "playing") {
+          this.wakeLock = handle;
+        } else {
+          void handle.release().catch((error: unknown) => {
+            console.debug("Screen wake lock release failed", error);
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        console.debug("Screen wake lock is unavailable", error);
+      });
+  }
+
+  private releaseWakeLock() {
+    const wakeLock = this.wakeLock;
+    this.wakeLock = undefined;
+    if (!wakeLock) return;
+    void wakeLock.release().catch((error: unknown) => {
+      console.debug("Screen wake lock release failed", error);
+    });
   }
 
   showMenu() {
@@ -1655,6 +2015,7 @@ class DogfightEngine {
     this.mouseFire = false;
     this.sideways = false;
     this.sidewaysRotation = 0;
+    this.bankRoll = 0;
     this.sidewaysStartRotation = 0;
     this.sidewaysTargetRotation = 0;
     this.sidewaysTween = 1;
@@ -1879,9 +2240,13 @@ class DogfightEngine {
     }
     let fire =
       this.mouseFire ||
+      this.touchFire ||
       this.keys.has("ControlLeft") ||
       this.keys.has("ControlRight");
-    let boost = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight");
+    let boost =
+      this.touchBoost ||
+      this.keys.has("ShiftLeft") ||
+      this.keys.has("ShiftRight");
 
     const gamepads = navigator.getGamepads?.() ?? [];
     const gamepad = Array.from(gamepads).find(
@@ -1979,6 +2344,22 @@ class DogfightEngine {
       FLIGHT_CONTROL_RESPONSE,
       delta,
     );
+
+    // Lay the ship over into the turn. On a phone it copies the phone's roll
+    // exactly; that reading is already smoothed, and damping it again would
+    // leave the ship trailing the hand. Other inputs bank in proportion to
+    // the steering. Rotating the model rather than the flight frame keeps it
+    // decorative: holding a turn never bends the climb input into a turn.
+    this.bankRoll =
+      this.activeInput === "PHONE / GYRO"
+        ? this.phoneBankRoll
+        : THREE.MathUtils.damp(
+            this.bankRoll,
+            -this.mouseXPercent * MAX_BANK_ROLL,
+            BANK_ROLL_RESPONSE,
+            delta,
+          );
+    this.playerModel.rotation.z = this.bankRoll;
 
     this.tempEuler.set(
       this.angularVelocity.x * delta,
@@ -2401,7 +2782,13 @@ class DogfightEngine {
         .set(0, 0.54, -0.32)
         .applyQuaternion(this.player.quaternion)
         .add(this.player.position);
-      this.camera.quaternion.copy(this.player.quaternion);
+      // From inside the cockpit the ship is invisible, so the bank has to
+      // show up as the horizon laying over instead.
+      this.camera.quaternion
+        .copy(this.player.quaternion)
+        .multiply(
+          this.tempQ1.setFromAxisAngle(LOCAL_ROLL_AXIS, this.bankRoll),
+        );
       this.camera.up.set(0, 1, 0);
     }
   }
@@ -2531,6 +2918,18 @@ class DogfightEngine {
       renderScale: this.effectiveScale,
       diagnostics: this.diagnostics,
       input: this.activeInput,
+      sideways: this.sideways,
+      rawGyroX: this.rawGyroX,
+      rawGyroY: this.rawGyroY,
+      isTouchDevice: this.isTouchDevice,
+      gyroPermission: this.gyroPermission,
+      onFireStart: () => this.setTouchFire(true),
+      onFireEnd: () => this.setTouchFire(false),
+      onBoostStart: () => this.setTouchBoost(true),
+      onBoostEnd: () => this.setTouchBoost(false),
+      onToggleSideways: () => this.toggleSideways(),
+      onToggleCamera: () => this.toggleCamera(),
+      onCalibrateGyro: () => this.calibrateGyro(),
     });
   }
 
@@ -2551,12 +2950,18 @@ class DogfightEngine {
 
   dispose() {
     this.disposed = true;
+    this.releaseWakeLock();
     this.resizeObserver?.disconnect();
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
     window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("mousemove", this.onMouseMove);
     window.removeEventListener("mouseup", this.onCanvasMouseUp);
+    window.removeEventListener("deviceorientation", this.onDeviceOrientation);
+    window.removeEventListener("orientationchange", this.onScreenOrientationChange);
+    window.removeEventListener("touchstart", this.onTouchStart);
+    window.removeEventListener("touchmove", this.onTouchMove);
+    window.removeEventListener("touchend", this.onTouchEnd);
     window.removeEventListener("resize", this.resize);
     window.visualViewport?.removeEventListener("resize", this.resize);
     document.removeEventListener("visibilitychange", this.onVisibility);
@@ -2607,7 +3012,9 @@ function GameRuntime({
       return;
     }
 
-    void loadShipModelLibrary()
+    const isTouchDevice =
+      "ontouchstart" in window || navigator.maxTouchPoints > 0;
+    void loadShipModelLibrary(isTouchDevice)
       .then((library) => {
         if (cancelled) {
           disposeModelLibrary(library);
@@ -2877,13 +3284,57 @@ function SettingsPanel({
   );
 }
 
-function ControlsPanel({ onClose }: { onClose: () => void }) {
+function MobileGuidePanel({ onClose }: { onClose: () => void }) {
   return (
     <div className="overlay">
-      <section className="pause-card" aria-label="Controls">
+      <section className="pause-card mobile-guide-card" aria-label="Phone Setup Guide">
+        <span className="menu-kicker">Mobile Local Playtest Guide</span>
+        <h2>iPhone 13 Pro Setup</h2>
+        <div className="mobile-guide-content">
+          <ol className="mobile-guide-steps">
+            <li>
+              <strong>1. Connect Wi-Fi:</strong> Ensure iPhone 13 Pro is on the same local Wi-Fi network.
+            </li>
+            <li>
+              <strong>2. Open Safari:</strong> Navigate to your desktop IP: <code>http://&lt;desktop-ip&gt;:3000</code>.
+            </li>
+            <li>
+              <strong>3. Allow Motion:</strong> Tap <strong>Allow</strong> when iOS Safari requests Device Motion access.
+            </li>
+            <li>
+              <strong>4. Calibrate Tilt:</strong> Hold your phone comfortably and tap <strong>CALIB TILT</strong> to set zero angle.
+            </li>
+          </ol>
+          <div className="mobile-summary-box">
+            <h4>Flight Gyro Controls:</h4>
+            <ul>
+              <li><strong>Turn Right / Left:</strong> Tilt phone to the right or left</li>
+              <li><strong>Pitch Up (climb):</strong> Tilt top of phone toward you</li>
+              <li><strong>Dive Down:</strong> Tilt bottom of phone up</li>
+            </ul>
+          </div>
+        </div>
+        <button className="primary-btn" onClick={onClose}>
+          Return
+        </button>
+      </section>
+    </div>
+  );
+}
+
+function ControlsPanel({
+  onClose,
+  onOpenMobileGuide,
+}: {
+  onClose: () => void;
+  onOpenMobileGuide?: () => void;
+}) {
+  return (
+    <div className="overlay">
+      <section className="pause-card controls-card-wide" aria-label="Controls">
         <span className="menu-kicker">Flight reference</span>
         <h2>Controls</h2>
-        <div className="controls-grid">
+        <div className="controls-grid controls-grid-3">
           <div className="control-card">
             <h3>Keyboard + mouse</h3>
             <div className="control-line">
@@ -2895,18 +3346,19 @@ function ControlsPanel({ onClose }: { onClose: () => void }) {
               <kbd>Left click / Space</kbd>
             </div>
             <div className="control-line">
-              <span>Fire</span>
+              <span>Fire cannon</span>
               <kbd>Right click / Ctrl</kbd>
             </div>
             <div className="control-line">
-              <span>Afterburner (hold, 10s)</span>
-              <kbd>Shift</kbd>
+              <span>Afterburner</span>
+              <kbd>Shift (10s hold)</kbd>
             </div>
             <div className="control-line">
-              <span>Camera / diagnostics</span>
+              <span>Camera / diag</span>
               <kbd>C / P</kbd>
             </div>
           </div>
+
           <div className="control-card">
             <h3>Gamepad</h3>
             <div className="control-line">
@@ -2918,11 +3370,11 @@ function ControlsPanel({ onClose }: { onClose: () => void }) {
               <kbd>A</kbd>
             </div>
             <div className="control-line">
-              <span>Fire</span>
+              <span>Fire cannon</span>
               <kbd>RT</kbd>
             </div>
             <div className="control-line">
-              <span>Afterburner (hold, 10s)</span>
+              <span>Afterburner</span>
               <kbd>LT</kbd>
             </div>
             <div className="control-line">
@@ -2930,10 +3382,42 @@ function ControlsPanel({ onClose }: { onClose: () => void }) {
               <kbd>Y</kbd>
             </div>
           </div>
+
+          <div className="control-card">
+            <h3>Phone / Gyro tilt</h3>
+            <div className="control-line">
+              <span>Turn right / left</span>
+              <kbd>Tilt right / left</kbd>
+            </div>
+            <div className="control-line">
+              <span>Pitch up (climb)</span>
+              <kbd>Tilt top toward you</kbd>
+            </div>
+            <div className="control-line">
+              <span>Dive down</span>
+              <kbd>Tilt bottom up</kbd>
+            </div>
+            <div className="control-line">
+              <span>Touch fire / boost</span>
+              <kbd>On-screen buttons</kbd>
+            </div>
+            <div className="control-line">
+              <span>Zero tilt angle</span>
+              <kbd>Tap “CALIB TILT”</kbd>
+            </div>
+          </div>
         </div>
-        <button className="primary-btn" onClick={onClose}>
-          Return
-        </button>
+
+        <div className="pause-actions">
+          {onOpenMobileGuide && (
+            <button className="secondary-btn" onClick={onOpenMobileGuide}>
+              iPhone Setup Guide
+            </button>
+          )}
+          <button className="primary-btn" onClick={onClose}>
+            Return
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -2943,7 +3427,9 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
   const contactColor = (kind: EnemyKind) =>
     kind === "bomber" ? "#72e9ff" : kind === "interceptor" ? "#ffb54a" : "#ff5c55";
   return (
-    <div className="hud" aria-live="off">
+    <div className={`hud ${
+      hud.isTouchDevice ? "is-touch" : ""
+    }`} aria-live="off">
       <div className="hud-top">
         <div className="hud-stat">
           Wave<strong>{String(hud.wave).padStart(2, "0")}</strong>
@@ -2999,6 +3485,7 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
       </div>
 
       <div className="reticle" />
+
       <div
         className="target-lock"
         style={
@@ -3040,6 +3527,84 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
         ))}
       </div>
 
+      {hud.isTouchDevice && (
+        <div className="touch-overlay">
+        <div className="touch-top-bar">
+          {/* Only worth the room while motion
+          needs the player's attention. */}
+          {hud.gyroPermission !== "granted" && (
+            <span className="touch-motion-status">
+              MOTION {hud.gyroPermission}
+            </span>
+          )}
+          <button
+            className="touch-btn touch-btn-util"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              hud.onCalibrateGyro?.();
+            }}
+          >
+            <span>CALIB TILT</span>
+          </button>
+          <button
+            className="touch-btn touch-btn-util"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              hud.onToggleCamera?.();
+            }}
+          >
+            <span>CAM ({hud.camera})</span>
+          </button>
+        </div>
+
+        <div className="touch-left-cluster">
+          <button
+            className={`touch-btn touch-btn-boost ${hud.boostActive ? "active" : ""}`}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              hud.onBoostStart?.();
+            }}
+            onPointerUp={(e) => {
+              e.preventDefault();
+              e.currentTarget.releasePointerCapture(e.pointerId);
+              hud.onBoostEnd?.();
+            }}
+            onPointerCancel={(e) => {
+              e.preventDefault();
+              hud.onBoostEnd?.();
+            }}
+            onLostPointerCapture={() => hud.onBoostEnd?.()}
+          >
+            <span>BOOST</span>
+          </button>
+        </div>
+
+        <div className="touch-right-cluster">
+          <button
+            className="touch-btn touch-btn-fire"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              hud.onFireStart?.();
+            }}
+            onPointerUp={(e) => {
+              e.preventDefault();
+              e.currentTarget.releasePointerCapture(e.pointerId);
+              hud.onFireEnd?.();
+            }}
+            onPointerCancel={(e) => {
+              e.preventDefault();
+              hud.onFireEnd?.();
+            }}
+            onLostPointerCapture={() => hud.onFireEnd?.()}
+          >
+            <span>FIRE</span>
+          </button>
+        </div>
+        </div>
+      )}
+
       {hud.diagnostics && (
         <div
           className={`perf-panel ${IS_DEVELOPMENT ? "with-r3f-perf" : ""}`}
@@ -3077,7 +3642,9 @@ export function StarfighterGame() {
   const [settings, setSettings] = useState<GraphicsSettings>(loadSettings);
   const [showSettings, setShowSettings] = useState(false);
   const [showControls, setShowControls] = useState(false);
+  const [showMobileGuide, setShowMobileGuide] = useState(false);
   const [highScore, setHighScore] = useState(loadHighScore);
+  const [isPortrait, setIsPortrait] = useState(false);
 
   const callbacks = useMemo<GameCallbacks>(
     () => ({
@@ -3096,9 +3663,67 @@ export function StarfighterGame() {
     }
   }, [settings]);
 
+  useEffect(() => {
+    const updateOrientation = () => {
+      setIsPortrait(window.innerHeight > window.innerWidth);
+    };
+    updateOrientation();
+    window.addEventListener("resize", updateOrientation, { passive: true });
+    window.addEventListener("orientationchange", updateOrientation, {
+      passive: true,
+    });
+    return () => {
+      window.removeEventListener("resize", updateOrientation);
+      window.removeEventListener("orientationchange", updateOrientation);
+    };
+  }, []);
+
+  useEffect(() => {
+    // Publish the visual viewport - the part of the page the browser's own
+    // chrome is not covering. Fixed elements are positioned against the
+    // layout viewport, which on iOS Safari with `viewport-fit=cover` runs the
+    // full height of the screen and therefore continues behind the tab bar,
+    // so a height alone is not enough: the offset has to move with it or the
+    // whole shell sits shifted off the visible area.
+    const updateViewport = () => {
+      const visual = window.visualViewport;
+      const style = document.documentElement.style;
+      style.setProperty(
+        "--viewport-width",
+        `${visual?.width ?? window.innerWidth}px`,
+      );
+      style.setProperty(
+        "--viewport-height",
+        `${visual?.height ?? window.innerHeight}px`,
+      );
+      style.setProperty("--viewport-offset-top", `${visual?.offsetTop ?? 0}px`);
+      style.setProperty("--viewport-offset-left", `${visual?.offsetLeft ?? 0}px`);
+    };
+    updateViewport();
+    window.addEventListener("resize", updateViewport, { passive: true });
+    window.addEventListener("orientationchange", updateViewport, {
+      passive: true,
+    });
+    window.visualViewport?.addEventListener("resize", updateViewport, {
+      passive: true,
+    });
+    window.visualViewport?.addEventListener("scroll", updateViewport, {
+      passive: true,
+    });
+    return () => {
+      window.removeEventListener("resize", updateViewport);
+      window.removeEventListener("orientationchange", updateViewport);
+      window.visualViewport?.removeEventListener("resize", updateViewport);
+      window.visualViewport?.removeEventListener("scroll", updateViewport);
+    };
+  }, []);
+
   const begin = useCallback(() => {
     setShowSettings(false);
     setShowControls(false);
+    setShowMobileGuide(false);
+    requestLandscapeLock();
+    engineRef.current?.requestGyroPermission();
     engineRef.current?.begin();
   }, []);
 
@@ -3112,9 +3737,16 @@ export function StarfighterGame() {
     setShowControls(true);
   }, [status]);
 
+  const openMobileGuide = useCallback(() => {
+    if (status === "playing") engineRef.current?.pause();
+    setShowControls(false);
+    setShowMobileGuide(true);
+  }, [status]);
+
   const closePanel = useCallback(() => {
     setShowSettings(false);
     setShowControls(false);
+    setShowMobileGuide(false);
   }, []);
 
   const scoreLine = useMemo(
@@ -3147,6 +3779,16 @@ export function StarfighterGame() {
         style={{ "--damage": hud.damage } as React.CSSProperties}
       />
 
+      {hud.isTouchDevice && isPortrait && (
+        <div className="orientation-gate">
+          <section className="orientation-card" aria-label="Rotate phone">
+            <span className="menu-kicker">Flight orientation</span>
+            <h2>Turn your phone sideways</h2>
+            <p>Rogue Vector plays in landscape mode.</p>
+          </section>
+        </div>
+      )}
+
       {status === "loading" && (
         <div className="overlay">
           <section className="pause-card">
@@ -3161,7 +3803,7 @@ export function StarfighterGame() {
 
       {status === "playing" && <GameHud hud={hud} />}
 
-      {status === "menu" && !showSettings && !showControls && (
+      {status === "menu" && !showSettings && !showControls && !showMobileGuide && (
         <div className="overlay">
           <section className="menu">
             <span className="menu-kicker">XW / 77 combat simulator</span>
@@ -3188,16 +3830,19 @@ export function StarfighterGame() {
               <button className="secondary-btn" onClick={openControls}>
                 Controls
               </button>
+              <button className="secondary-btn" onClick={openMobileGuide}>
+                Phone Setup
+              </button>
             </div>
             <footer className="menu-footer">
-              <span>WebGL2 // Desktop flight system</span>
+              <span>WebGL2 // Desktop & Mobile gyro flight system</span>
               <span>{scoreLine}</span>
             </footer>
           </section>
         </div>
       )}
 
-      {status === "paused" && !showSettings && !showControls && (
+      {status === "paused" && !showSettings && !showControls && !showMobileGuide && (
         <div className="overlay">
           <section className="pause-card">
             <span className="menu-kicker">Flight suspended</span>
@@ -3215,6 +3860,9 @@ export function StarfighterGame() {
               </button>
               <button className="secondary-btn" onClick={openControls}>
                 Controls
+              </button>
+              <button className="secondary-btn" onClick={openMobileGuide}>
+                Phone Setup
               </button>
               <button
                 className="secondary-btn"
@@ -3260,9 +3908,8 @@ export function StarfighterGame() {
             <span className="menu-kicker">Renderer unavailable</span>
             <h2>WebGL2 required</h2>
             <p>
-              Rogue Vector supports current desktop releases of Chrome, Edge,
-              Firefox, and Safari with hardware acceleration enabled. WebGL1 and
-              mobile browsers are not supported.
+              Rogue Vector supports WebGL2 on desktop and mobile browsers
+              (Chrome, Edge, Firefox, and Safari) with hardware acceleration enabled.
             </p>
           </section>
         </div>
@@ -3288,7 +3935,13 @@ export function StarfighterGame() {
           onClose={closePanel}
         />
       )}
-      {showControls && <ControlsPanel onClose={closePanel} />}
+      {showControls && (
+        <ControlsPanel
+          onClose={closePanel}
+          onOpenMobileGuide={openMobileGuide}
+        />
+      )}
+      {showMobileGuide && <MobileGuidePanel onClose={closePanel} />}
     </main>
   );
 }
