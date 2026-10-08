@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  turbopack: {
+    root: import.meta.dirname,
+  },
   // Hosts other than localhost that may load the dev server
   // - for example a tunnel used to test on a phone.
   // Each developer's tunnel is their own, so it comes from

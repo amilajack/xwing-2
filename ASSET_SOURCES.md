@@ -23,7 +23,7 @@ Sketchfab requires an account API token even for freely downloadable models.
 Keep the token outside the repository and import the reviewed assets with:
 
 ```bash
-SKETCHFAB_API_TOKEN=your_token npm run assets:sketchfab
+SKETCHFAB_API_TOKEN=your_token pnpm run assets:sketchfab
 ```
 
 After a successful import, `public/models/sketchfab-attribution.json` records

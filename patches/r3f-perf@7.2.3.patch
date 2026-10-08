@@ -1,0 +1,16 @@
+diff --git a/dist/roboto.woff.js b/dist/roboto.woff.js
+index 894eb64e7ecdc143d52e4e8fac4750f515101854..147ec667af3d527b9a8b4387e29371682fa9b857 100644
+--- a/dist/roboto.woff.js
++++ b/dist/roboto.woff.js
+@@ -3,2 +3 @@
+ module.exports = localFont;
+-//# sourceMappingURL=roboto.woff.js.map
+diff --git a/dist/roboto.woff.mjs b/dist/roboto.woff.mjs
+index c630fcca6dc4a076fa80e12aa6cfc7d8c8c7e353..896c094279cc16a71454f33a609f9474ab4ac8c1 100644
+--- a/dist/roboto.woff.mjs
++++ b/dist/roboto.woff.mjs
+@@ -2,4 +2,3 @@ const localFont = "data:font/woff;base64,d09GRk9UVE8AAC6gAA0AAAAAQzgAAQAAAAAAAAA
+ export {
+   localFont as default
+ };
+-//# sourceMappingURL=roboto.woff.mjs.map
