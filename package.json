@@ -7,13 +7,18 @@
   },
   "scripts": {
     "assets:sketchfab": "node scripts/fetch-sketchfab-assets.mjs",
-    "dev": "next dev --webpack --hostname 0.0.0.0",
+    "dev": "next dev --turbopack --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start",
-    "test": "node --test tests/device-tilt.test.mjs && npm run build && node --test tests/rendered-html.test.mjs",
+    "test": "node --test tests/device-tilt.test.mjs && pnpm run build && node --test tests/rendered-html.test.mjs",
     "verify:browser": "PLAYWRIGHT_HEADED=1 node scripts/verify-game-playwright.mjs",
     "verify:browser:headless": "node scripts/verify-game-playwright.mjs",
-    "lint": "next lint"
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "check:format": "git diff --check && git diff --cached --check",
+    "check": "pnpm run check:format && pnpm run lint && pnpm run typecheck && pnpm test",
+    "preinstall": "node scripts/require-pnpm.mjs",
+    "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
     "@react-three/fiber": "^9.6.1",
@@ -42,5 +47,6 @@
     "vite": "8.0.13",
     "wrangler": "4.92.0"
   },
-  "type": "module"
+  "type": "module",
+  "packageManager": "pnpm@12.6.0"
 }

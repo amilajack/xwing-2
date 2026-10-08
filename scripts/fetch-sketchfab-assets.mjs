@@ -59,7 +59,7 @@ if (!token) {
     [
       "Sketchfab authentication is required to download these licensed models.",
       "Create an API token at https://sketchfab.com/settings/password and run:",
-      "  SKETCHFAB_API_TOKEN=... npm run assets:sketchfab",
+      "  SKETCHFAB_API_TOKEN=... pnpm run assets:sketchfab",
       "Keep the token in your shell environment; do not commit it.",
     ].join("\n"),
   );
@@ -99,7 +99,7 @@ async function findModelFile(directory) {
 }
 
 function gltfTransform(...arguments_) {
-  execFileSync("npm", ["exec", "--", "gltf-transform", ...arguments_], {
+  execFileSync("pnpm", ["exec", "gltf-transform", ...arguments_], {
     cwd: projectRoot,
     stdio: "inherit",
   });

@@ -6,23 +6,25 @@ with keyboard, mouse, touch, or phone-tilt controls.
 
 ## Run locally
 
-Requires Node.js 22.13 or newer.
+Requires Node.js 22.13 or newer and pnpm 12.6.0. Install the pinned pnpm
+version with `corepack enable && corepack prepare pnpm@12.6.0 --activate`.
 
 ```bash
-npm install
-npm run dev
+pnpm install --frozen-lockfile
+pnpm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). Ultra is the default
-graphics preset. Phone motion controls require Safari permission and a secure
-context. iPhone Safari does not show the motion-permission prompt from a plain
+graphics preset. Development uses Turbopack. Phone motion controls require
+Safari permission and a secure context. iPhone Safari does not show the
+motion-permission prompt from a plain
 LAN `http://` URL, so serve the game over HTTPS, for example with Tailscale
 Serve:
 
 ```bash
 # Terminal 1
-npm run build
-npm start
+pnpm run build
+pnpm start
 
 # Terminal 2
 tailscale serve --bg 3000
@@ -31,7 +33,7 @@ tailscale serve --bg 3000
 Open the HTTPS address `tailscale serve` prints on the iPhone, tap **Launch fighter**,
 allow motion access, and calibrate the neutral phone position. The game asks
 for landscape orientation and displays a rotate prompt when the browser cannot
-lock orientation itself. For stable phone testing, use `npm start`; `npm run
+lock orientation itself. For stable phone testing, use `pnpm start`; `pnpm run
 dev` enables Next.js HMR and can refresh Safari or Brave while the router is
 initializing. The development server also rejects hosts it does not know, so
 to use it through the tunnel, put that host in `ALLOWED_DEV_ORIGINS` in
@@ -40,11 +42,18 @@ to use it through the tunnel, put that host in `ALLOWED_DEV_ORIGINS` in
 Useful checks:
 
 ```bash
-npm run lint
-npx tsc --noEmit
-npm test
-npm run verify:browser
+pnpm run lint
+pnpm run typecheck
+pnpm test
+pnpm run verify:browser
 ```
+
+`pnpm run check` runs whitespace checks, lint, type checking, and the production
+build and tests. `pnpm install` installs the version-controlled pre-commit hook,
+which runs the same checks and blocks commits on failure.
+
+The pnpm patch for `r3f-perf` removes invalid font source-map references so
+Turbopack can compile the development diagnostics; font data is unchanged.
 
 The browser verification launches headed Chrome through Playwright so Ultra
 uses the Mac GPU instead of headless Chromium's software SwiftShader renderer.
@@ -88,7 +97,7 @@ The reviewed high-quality source models and licenses are listed in
 free downloads, so keep your API token in the shell and run:
 
 ```bash
-SKETCHFAB_API_TOKEN=your_token npm run assets:sketchfab
+SKETCHFAB_API_TOKEN=your_token pnpm run assets:sketchfab
 ```
 
 The importer verifies each model's creator, downloadable status, and CC BY
