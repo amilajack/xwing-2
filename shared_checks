@@ -1,0 +1,3 @@
+#!/bin/bash
+# Checks that should run locally, pre-commit, AND in CI.
+pnpm run check

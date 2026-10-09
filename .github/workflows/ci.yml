@@ -1,0 +1,17 @@
+on: [push, workflow_dispatch]
+
+name: check
+permissions:
+  contents: read
+jobs:
+  code:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/setup@v3
+        with:
+          runtime: node
+          cache: true
+          require-lockfile: true
+      - run: ./shared_checks

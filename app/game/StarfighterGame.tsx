@@ -2141,13 +2141,7 @@ class DogfightEngine {
     const delta = Math.min(0.05, Math.max(0, frameDelta));
 
     if (this.status === "playing") {
-      this.accumulator = Math.min(this.accumulator + delta, FIXED_STEP * 5);
-      let steps = 0;
-      while (this.accumulator >= FIXED_STEP && steps < 5) {
-        this.fixedUpdate(FIXED_STEP);
-        this.accumulator -= FIXED_STEP;
-        steps += 1;
-      }
+      this.fixedUpdate(delta);
       this.updateCamera(delta);
       this.updateAdaptiveResolution(delta);
     } else {

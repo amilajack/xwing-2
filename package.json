@@ -10,7 +10,7 @@
     "dev": "next dev --turbopack --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start",
-    "test": "node --test tests/device-tilt.test.mjs && pnpm run build && node --test tests/rendered-html.test.mjs",
+    "test": "node --test tests/device-tilt.test.mjs tests/ship-motion.test.mjs && pnpm run build && node --test tests/rendered-html.test.mjs",
     "verify:browser": "PLAYWRIGHT_HEADED=1 node scripts/verify-game-playwright.mjs",
     "verify:browser:headless": "node scripts/verify-game-playwright.mjs",
     "lint": "eslint .",
