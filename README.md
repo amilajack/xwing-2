@@ -1,8 +1,9 @@
 # Rogue Vector
 
-A single-player Three.js/WebGL2 space dogfight. Fly an X-wing against TIE
+A single-player Three.js/WebGPU space dogfight. Fly an X-wing against TIE
 fighters, TIE interceptors, and stealth bombers through a dense asteroid field
-with keyboard, mouse, touch, or phone-tilt controls.
+with keyboard, mouse, touch, or phone-tilt controls. Browsers without WebGPU
+fall back to WebGL2 automatically.
 
 ## Run locally
 
@@ -52,14 +53,15 @@ pnpm run verify:browser
 build and tests. `pnpm install` installs the version-controlled pre-commit hook,
 which runs the same checks and blocks commits on failure.
 
-The pnpm patch for `r3f-perf` removes invalid font source-map references so
-Turbopack can compile the development diagnostics; font data is unchanged.
+Development builds mount three's renderer inspector, which reports frame, CPU,
+and GPU timings on either backend. Append `?qa=1&forceWebGL=1` to the URL to
+run the WebGL2 fallback on a machine that supports WebGPU.
 
 The browser verification launches headed Chrome through Playwright so Ultra
 uses the Mac GPU instead of headless Chromium's software SwiftShader renderer.
-It checks changing idle and combat frames, WebGL2, controls, camera switching,
-all graphics tiers, HTTP/console errors, and a visual fleet lineup. Evidence is
-written under `outputs/playwright/`.
+It checks changing idle and combat frames, the WebGPU backend, controls, camera
+switching, all graphics tiers, HTTP/console errors, a visual fleet lineup, and
+the WebGL2 fallback. Evidence is written under `outputs/playwright/`.
 
 ## Controls
 

@@ -29,7 +29,7 @@ export async function generateMetadata(): Promise<Metadata> {
     requestHeaders.get("x-forwarded-proto") ??
     (host?.startsWith("localhost") ? "http" : "https");
   const baseUrl = new URL(`${protocol}://${host ?? "localhost:3000"}`);
-  const description = "A performance-first WebGL2 starfighter dogfight.";
+  const description = "A performance-first WebGPU starfighter dogfight.";
 
   return {
     metadataBase: baseUrl,

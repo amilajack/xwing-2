@@ -78,7 +78,9 @@ test("keeps performance-critical systems explicit and bounded", async () => {
       readFile(new URL("../package.json", import.meta.url), "utf8"),
     ]);
 
-  assert.match(source, /getContext\("webgl2"/);
+  assert.match(source, /from "three\/webgpu"/);
+  assert.match(source, /new THREE\.WebGPURenderer/);
+  assert.match(source, /forceWebGL/);
   assert.match(source, /new GLTFLoader\(\)/);
   assert.match(source, /\/models\/xwing-high\.glb/);
   assert.match(source, /\/models\/tie-fighter-high\.glb/);
@@ -87,8 +89,7 @@ test("keeps performance-critical systems explicit and bounded", async () => {
   assert.match(source, /\/models\/asteroid-high\.glb/);
   assert.match(source, /const DEFAULT_SETTINGS = QUALITY_PRESETS\.ultra/);
   assert.match(source, /process\.env\.NODE_ENV === "development"/);
-  assert.match(source, /import\("r3f-perf"\)/);
-  assert.match(source, /development-r3f-perf/);
+  assert.match(source, /three\/examples\/jsm\/inspector\/Inspector\.js/);
   assert.match(source, /<Canvas/);
   assert.match(source, /settings\.quality === "low" \? "low" : "high"/);
   assert.match(source, /const MAX_ENEMIES = 20/);
@@ -119,7 +120,7 @@ test("keeps performance-critical systems explicit and bounded", async () => {
   assert.match(globalCss, /height: var\(--viewport-height/);
   assert.match(packageJson, /"three":/);
   assert.match(packageJson, /"@react-three\/fiber":/);
-  assert.match(packageJson, /"r3f-perf":/);
+  assert.doesNotMatch(packageJson, /"r3f-perf":/);
   assert.match(packageJson, /"assets:sketchfab":/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton|drizzle/);
   for (const uid of [

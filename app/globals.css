@@ -369,8 +369,18 @@ button {
   line-height: 1.7;
 }
 
-.perf-panel.with-r3f-perf {
-  top: 50px;
+/* three's development inspector pins itself to the top-right corner, over the
+   camera readout. A transformed box re-anchors its fixed children below it. */
+.three-inspector {
+  position: fixed;
+  inset: 56px 0 0;
+  z-index: 1001;
+  transform: translateZ(0);
+  pointer-events: none;
+}
+
+.three-inspector > * {
+  pointer-events: auto;
 }
 
 .perf-panel div {
