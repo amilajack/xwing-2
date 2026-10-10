@@ -45,56 +45,51 @@ page.on("response", (response) => {
 
 const hash = (buffer) => createHash("sha256").update(buffer).digest("hex");
 
-async function readFramebufferStats() {
-  return gameCanvas.evaluate((canvas) => {
-    const gl = canvas.getContext("webgl2");
-    if (!gl) return null;
-    return new Promise((resolveStats) => {
-      requestAnimationFrame(() => {
-        const width = gl.drawingBufferWidth;
-        const height = gl.drawingBufferHeight;
-        const sampleWidth = Math.min(512, width);
-        const sampleHeight = Math.min(320, height);
-        const pixels = new Uint8Array(sampleWidth * sampleHeight * 4);
-        gl.readPixels(
-          Math.floor((width - sampleWidth) / 2),
-          Math.floor((height - sampleHeight) / 2),
-          sampleWidth,
-          sampleHeight,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          pixels,
-        );
-        let coloredSamples = 0;
-        let luminance = 0;
-        let sampled = 0;
-        const stride = Math.max(4, Math.floor(pixels.length / 45_000 / 4) * 4);
-        for (let index = 0; index < pixels.length; index += stride) {
-          const red = pixels[index];
-          const green = pixels[index + 1];
-          const blue = pixels[index + 2];
-          if (red + green + blue > 16) coloredSamples += 1;
-          luminance += red + green + blue;
-          sampled += 1;
-        }
-        const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
-        resolveStats({
-          width,
-          height,
-          sampleWidth,
-          sampleHeight,
-          sampled,
-          coloredSamples,
-          meanRgb: luminance / Math.max(1, sampled * 3),
-          version: gl.getParameter(gl.VERSION),
-          shadingLanguage: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
-          renderer: debugInfo
-            ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
-            : gl.getParameter(gl.RENDERER),
-        });
-      });
-    });
-  });
+// A WebGPU canvas has no context to read pixels back from, so the canvas is
+// measured from its own screenshot, decoded in the page.
+async function readCanvasStats(screenshot) {
+  return page.evaluate(async (encoded) => {
+    const blob = await (await fetch(`data:image/png;base64,${encoded}`)).blob();
+    const bitmap = await createImageBitmap(blob);
+    const sampleWidth = Math.min(512, bitmap.width);
+    const sampleHeight = Math.min(320, bitmap.height);
+    const context = new OffscreenCanvas(sampleWidth, sampleHeight).getContext("2d");
+    context.drawImage(
+      bitmap,
+      Math.floor((bitmap.width - sampleWidth) / 2),
+      Math.floor((bitmap.height - sampleHeight) / 2),
+      sampleWidth,
+      sampleHeight,
+      0,
+      0,
+      sampleWidth,
+      sampleHeight,
+    );
+    const pixels = context.getImageData(0, 0, sampleWidth, sampleHeight).data;
+    let coloredSamples = 0;
+    let luminance = 0;
+    let sampled = 0;
+    const stride = Math.max(4, Math.floor(pixels.length / 45_000 / 4) * 4);
+    for (let index = 0; index < pixels.length; index += stride) {
+      const red = pixels[index];
+      const green = pixels[index + 1];
+      const blue = pixels[index + 2];
+      if (red + green + blue > 16) coloredSamples += 1;
+      luminance += red + green + blue;
+      sampled += 1;
+    }
+    const canvas = document.querySelector(".game-canvas canvas");
+    return {
+      width: canvas?.width ?? 0,
+      height: canvas?.height ?? 0,
+      sampleWidth,
+      sampleHeight,
+      sampled,
+      coloredSamples,
+      meanRgb: luminance / Math.max(1, sampled * 3),
+      backend: window.__rogueVectorQa?.snapshot().backend ?? null,
+    };
+  }, screenshot.toString("base64"));
 }
 
 let report;
@@ -127,17 +122,16 @@ try {
     await page.waitForFunction(
       ({ width, height }) => {
         const canvas = document.querySelector(".game-canvas canvas");
-        const gl = canvas?.getContext("webgl2");
         const qaViewport = window.__rogueVectorQa?.snapshot().viewport;
-        if (!canvas || !gl || !qaViewport) return false;
+        if (!canvas || !qaViewport) return false;
         const bounds = canvas.getBoundingClientRect();
         return (
           Math.round(bounds.left) === 0 &&
           Math.round(bounds.top) === 0 &&
           Math.round(bounds.width) === width &&
           Math.round(bounds.height) === height &&
-          gl.drawingBufferWidth === width &&
-          gl.drawingBufferHeight === height &&
+          canvas.width === width &&
+          canvas.height === height &&
           Math.abs(qaViewport.cameraAspect - width / height) < 0.0001
         );
       },
@@ -145,7 +139,6 @@ try {
     );
     responsiveViewportChecks.push(
       await gameCanvas.evaluate((canvas) => {
-        const gl = canvas.getContext("webgl2");
         const bounds = canvas.getBoundingClientRect();
         return {
           viewport: [window.innerWidth, window.innerHeight],
@@ -155,10 +148,7 @@ try {
             Math.round(bounds.width),
             Math.round(bounds.height),
           ],
-          drawingBuffer: [
-            gl?.drawingBufferWidth ?? 0,
-            gl?.drawingBufferHeight ?? 0,
-          ],
+          drawingBuffer: [canvas.width, canvas.height],
           cameraAspect:
             window.__rogueVectorQa?.snapshot().viewport.cameraAspect ?? 0,
         };
@@ -168,12 +158,11 @@ try {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.waitForFunction(() => {
     const canvas = document.querySelector(".game-canvas canvas");
-    const gl = canvas?.getContext("webgl2");
     return (
       canvas?.clientWidth === 1440 &&
       canvas.clientHeight === 900 &&
-      gl?.drawingBufferWidth === 1440 &&
-      gl.drawingBufferHeight === 900
+      canvas.width === 1440 &&
+      canvas.height === 900
     );
   });
 
@@ -235,24 +224,15 @@ try {
     false,
     "resume retained stale gyro calibration",
   );
-  const developmentPerf = page.locator(".development-r3f-perf");
-  await developmentPerf.waitFor({ state: "visible" });
-  await page.waitForTimeout(900);
-  const developmentPerfText = await developmentPerf.innerText();
-  assert.match(
-    developmentPerfText,
-    /GPU[\s\S]*CPU[\s\S]*FPS/,
-    "r3f-perf did not render its GPU, CPU, and FPS labels",
+  const inspectorFps = page.locator(".three-inspector .fps-counter");
+  await inspectorFps.waitFor({ state: "visible" });
+  await page.waitForFunction(
+    () =>
+      Number(
+        document.querySelector(".three-inspector .fps-counter")?.textContent,
+      ) > 0,
   );
-  const perfCanvas = developmentPerf.locator("canvas");
-  const perfFrameA = await perfCanvas.screenshot();
-  await page.waitForTimeout(650);
-  const perfFrameB = await perfCanvas.screenshot();
-  assert.notEqual(
-    hash(perfFrameA),
-    hash(perfFrameB),
-    "r3f-perf did not update its live performance graph",
-  );
+  const developmentInspectorFps = Number(await inspectorFps.innerText());
   await page.screenshot({
     path: resolve(outputDirectory, "03-combat-stable.png"),
     fullPage: true,
@@ -338,11 +318,11 @@ try {
   await page.waitForTimeout(1200);
 
   const flightFrameA = await gameCanvas.screenshot();
-  const framebufferA = await readFramebufferStats();
+  const canvasStatsA = await readCanvasStats(flightFrameA);
   await page.mouse.move(340, 650);
   await page.waitForTimeout(900);
   const flightFrameB = await gameCanvas.screenshot();
-  const framebufferB = await readFramebufferStats();
+  const canvasStatsB = await readCanvasStats(flightFrameB);
   assert.notEqual(
     hash(flightFrameA),
     hash(flightFrameB),
@@ -350,10 +330,13 @@ try {
   );
   assert.ok(flightFrameA.length > 20_000, "first combat canvas capture is blank");
   assert.ok(flightFrameB.length > 20_000, "second combat canvas capture is blank");
-  assert.match(
-    framebufferA?.version ?? "",
-    /^WebGL 2\.0/,
-    "the combat canvas is not using WebGL2",
+  assert.ok(canvasStatsA.coloredSamples > 0, "the combat canvas rendered black");
+  // Headed Chrome reaches the GPU. Headless Chromium has no WebGPU adapter, so
+  // there the same run exercises the automatic WebGL2 fallback.
+  assert.equal(
+    canvasStatsA.backend,
+    headed ? "webgpu" : "webgl2",
+    "the combat canvas is not rendering through the expected backend",
   );
 
   await page.screenshot({
@@ -416,17 +399,40 @@ try {
     "fleet inspection did not stage every enemy model",
   );
 
+  // The WebGL2 fallback has to start and draw the same scene.
+  await page.goto(`${baseUrl}/?qa=1&forceWebGL=1`, {
+    waitUntil: "domcontentloaded",
+  });
+  await page.getByRole("button", { name: "Launch fighter" }).click();
+  await page.locator(".hud").waitFor({ state: "visible" });
+  await page.waitForTimeout(1200);
+  const fallbackFrameA = await gameCanvas.screenshot();
+  await page.waitForTimeout(650);
+  const fallbackFrameB = await gameCanvas.screenshot();
+  const fallback = await readCanvasStats(fallbackFrameB);
+  await page.screenshot({
+    path: resolve(outputDirectory, "06-webgl2-fallback.png"),
+    fullPage: true,
+  });
+  assert.equal(fallback.backend, "webgl2", "forceWebGL did not select WebGL2");
+  assert.ok(fallback.coloredSamples > 0, "the WebGL2 fallback rendered black");
+  assert.notEqual(
+    hash(fallbackFrameA),
+    hash(fallbackFrameB),
+    "the WebGL2 fallback canvas did not advance between frames",
+  );
+
   report = {
     url: page.url(),
     title: await page.title(),
     defaultQuality,
-    developmentPerfText,
-    developmentPerfFrameChanged: hash(perfFrameA) !== hash(perfFrameB),
+    developmentInspectorFps,
     responsiveViewportChecks,
     idleFrameChanged: hash(menuFrameA) !== hash(menuFrameB),
     combatFrameChanged: hash(flightFrameA) !== hash(flightFrameB),
-    framebufferA,
-    framebufferB,
+    canvasStatsA,
+    canvasStatsB,
+    fallback,
     diagnostics,
     initialFlightSnapshot,
     fullTurnSnapshot,

@@ -1,8 +1,6 @@
 "use client";
 
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -10,12 +8,21 @@ import {
   useState,
 } from "react";
 import {
+  advance,
   Canvas,
   useFrame,
   useThree,
   type GLProps,
 } from "@react-three/fiber";
-import * as THREE from "three";
+import * as THREE from "three/webgpu";
+import {
+  float,
+  instancedBufferAttribute,
+  max,
+  positionView,
+  screenDPR,
+  screenSize,
+} from "three/tsl";
 import { deviceTiltFromOrientation, type DeviceTilt } from "./deviceTilt";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
@@ -30,6 +37,7 @@ declare global {
         status: GameStatus;
         quality: QualityName;
         detail: "high" | "low";
+        backend: RenderBackend;
         touchDevice: boolean;
         gyroPermission: GyroPermissionState;
         gyro: { x: number; y: number; baseline: boolean };
@@ -60,6 +68,7 @@ type GameStatus =
   | "unsupported"
   | "asseterror";
 type QualityName = "low" | "medium" | "high" | "ultra" | "custom";
+type RenderBackend = "webgpu" | "webgl2";
 type EnemyKind = "fighter" | "interceptor" | "bomber";
 type GyroPermissionState =
   | "unavailable"
@@ -219,14 +228,6 @@ const DEFAULT_SETTINGS = QUALITY_PRESETS.ultra;
 const SETTINGS_KEY = "rogue-vector-settings-v2";
 const SCORE_KEY = "rogue-vector-high-score";
 const IS_DEVELOPMENT = process.env.NODE_ENV === "development";
-const DevelopmentPerf =
-  IS_DEVELOPMENT && typeof window !== "undefined"
-    ? lazy(() =>
-        import("r3f-perf").then(({ Perf }) => ({
-          default: Perf,
-        })),
-      )
-    : null;
 const FIXED_STEP = 1 / 60;
 const MAX_ENEMIES = 20;
 const MAX_PROJECTILES = 320;
@@ -261,6 +262,24 @@ const SUN_RENDER_DISTANCE = 1200;
 const SUN_SPRITE_DIAMETER = 400;
 const SUN_LIGHT_DISTANCE = 400;
 const SUN_SHADOW_EXTENT = 220;
+const STAR_SIZE = 1.35;
+const TONE_MAPPING_EXPOSURE = 1.45;
+const SKY_COLOR = 0x030b14;
+// three's ACES filmic fit: the matrices either side of its RRT/ODT curve.
+const ACES_INPUT_INVERSE = new THREE.Matrix3()
+  .set(
+    0.59719, 0.35458, 0.04823,
+    0.076, 0.90834, 0.01566,
+    0.0284, 0.13383, 0.83777,
+  )
+  .invert();
+const ACES_OUTPUT_INVERSE = new THREE.Matrix3()
+  .set(
+    1.60475, -0.53108, -0.07367,
+    -0.10208, 1.10813, -0.00605,
+    -0.00327, -0.07276, 1.07602,
+  )
+  .invert();
 const SHIP_DISPLAY_SIZE: Record<ShipRole, number> = {
   player: 9.8 * PLAYER_XWING_VISUAL_SCALE,
   fighter: 6.2,
@@ -276,25 +295,93 @@ type ShipModelLibrary = {
   asteroid: THREE.Mesh;
 };
 
-const createWebGL2Renderer: GLProps = ({ canvas }) => {
-  const htmlCanvas = canvas as HTMLCanvasElement;
-  const context = htmlCanvas.getContext("webgl2", {
-    alpha: false,
-    antialias: false,
-    depth: true,
-    desynchronized: true,
-    powerPreference: "high-performance",
-    stencil: false,
-  });
-  if (!context) throw new Error("WebGL2 is required.");
-  return new THREE.WebGLRenderer({
-    alpha: false,
-    antialias: false,
-    canvas: htmlCanvas,
-    context,
-    powerPreference: "high-performance",
-  });
-};
+/**
+ * WebGPURenderer tone-maps everything it draws, including the clear color, fog,
+ * and materials flagged `toneMapped: false`. This solves for the scene color
+ * that ACES at the game's exposure maps back onto a linear display color. The
+ * result can exceed 1 for bright targets.
+ */
+function sceneColorFor(display: THREE.Vector3, scene = new THREE.Vector3()) {
+  const { x, y, z } = display;
+  // Solve the RRT/ODT fit (x² + 0.0245786x − 0.000090537) /
+  // (0.983729x² + 0.432951x + 0.238081) = y for its positive root.
+  const unfit = (fitted: number) => {
+    const a = Math.max(1e-4, 1 - 0.983729 * fitted);
+    const b = 0.0245786 - 0.432951 * fitted;
+    const c = -(0.000090537 + 0.238081 * fitted);
+    return (-b + Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+  };
+  // Very saturated targets would need negative light, which the renderer
+  // clamps into a washed-out tint. Dim those until every channel is reachable.
+  for (let brightness = 1; brightness > 0; brightness -= 0.02) {
+    scene
+      .set(x, y, z)
+      .multiplyScalar(brightness)
+      .applyMatrix3(ACES_OUTPUT_INVERSE);
+    scene
+      .set(unfit(scene.x), unfit(scene.y), unfit(scene.z))
+      .applyMatrix3(ACES_INPUT_INVERSE)
+      .multiplyScalar(0.6 / TONE_MAPPING_EXPOSURE);
+    if (Math.min(scene.x, scene.y, scene.z) >= 0) break;
+  }
+  return scene;
+}
+
+/** The scene color that reaches the screen as the given sRGB hex color. */
+function displayColor(hex: number) {
+  const color = new THREE.Color(hex);
+  const scene = sceneColorFor(new THREE.Vector3(color.r, color.g, color.b));
+  return color.setRGB(scene.x, scene.y, scene.z);
+}
+
+// three's inspector reports frame, CPU, and GPU timings on either backend. It
+// has to be attached before the renderer initializes to mount its overlay.
+async function attachDevelopmentInspector(renderer: THREE.WebGPURenderer) {
+  if (!IS_DEVELOPMENT) return;
+  // The inspector and its Settings tab import each other. Turbopack can only
+  // evaluate that cycle when it is entered through the tab.
+  // @ts-expect-error -- three publishes no type declarations for this tab.
+  await import("three/examples/jsm/inspector/tabs/Settings.js");
+  const { Inspector } = await import(
+    "three/examples/jsm/inspector/Inspector.js"
+  );
+  renderer.inspector = new Inspector();
+}
+
+// react-three-fiber can ask for the renderer again while the first one is
+// still initializing, so each canvas keeps a single pending renderer.
+const pendingRenderers = new WeakMap<
+  HTMLCanvasElement,
+  Promise<THREE.WebGPURenderer>
+>();
+
+// WebGPURenderer targets WebGPU and falls back to its own WebGL2 backend when
+// the browser has no usable adapter. Initialization only fails with neither.
+function createRendererFactory(onUnavailable: () => void): GLProps {
+  return ({ canvas }) => {
+    const htmlCanvas = canvas as HTMLCanvasElement;
+    let pending = pendingRenderers.get(htmlCanvas);
+    if (!pending) {
+      const query = new URLSearchParams(window.location.search);
+      const renderer = new THREE.WebGPURenderer({
+        alpha: false,
+        antialias: false,
+        canvas: htmlCanvas,
+        depth: true,
+        // QA can pin the fallback backend on a WebGPU-capable machine.
+        forceWebGL: query.has("qa") && query.has("forceWebGL"),
+        powerPreference: "high-performance",
+        stencil: false,
+      });
+      pending = attachDevelopmentInspector(renderer)
+        .then(() => renderer.init())
+        .then(() => renderer);
+      pending.catch(onUnavailable);
+      pendingRenderers.set(htmlCanvas, pending);
+    }
+    return pending;
+  };
+}
 
 const EMPTY_HUD: HudSnapshot = {
   shields: 100,
@@ -574,9 +661,40 @@ function makeSunTexture() {
     context.fillRect(0, 0, 128, 128);
   }
 
-  const texture = new THREE.CanvasTexture(canvas);
+  // The disc glows over the sky without tone mapping. Each texel becomes the
+  // light to add to the sky so that the tone-mapped sum shows the gradient.
+  const texels = context?.getImageData(0, 0, 128, 128).data;
+  const light = new Uint16Array(128 * 128 * 4);
+  const sky = new THREE.Color(SKY_COLOR);
+  const skyLight = sceneColorFor(new THREE.Vector3().setFromColor(sky));
+  const skyDisplay = sky.getRGB({ r: 0, g: 0, b: 0 }, THREE.SRGBColorSpace);
+  const display = new THREE.Color();
+  const scene = new THREE.Vector3();
+  for (let index = 0; texels && index < texels.length; index += 4) {
+    const alpha = texels[index + 3] / 255 / 255;
+    display.setRGB(
+      Math.min(1, skyDisplay.r + texels[index] * alpha),
+      Math.min(1, skyDisplay.g + texels[index + 1] * alpha),
+      Math.min(1, skyDisplay.b + texels[index + 2] * alpha),
+      THREE.SRGBColorSpace,
+    );
+    sceneColorFor(scene.setFromColor(display), scene).sub(skyLight);
+    light[index] = THREE.DataUtils.toHalfFloat(Math.max(0, scene.x));
+    light[index + 1] = THREE.DataUtils.toHalfFloat(Math.max(0, scene.y));
+    light[index + 2] = THREE.DataUtils.toHalfFloat(Math.max(0, scene.z));
+    light[index + 3] = THREE.DataUtils.toHalfFloat(1);
+  }
 
-  texture.colorSpace = THREE.SRGBColorSpace;
+  const texture = new THREE.DataTexture(
+    light,
+    128,
+    128,
+    THREE.RGBAFormat,
+    THREE.HalfFloatType,
+  );
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.needsUpdate = true;
 
   return texture;
 }
@@ -1083,7 +1201,7 @@ class DogfightEngine {
   private readonly camera: THREE.PerspectiveCamera;
   private readonly assets: SharedAssets;
   private readonly audio = new SynthAudio();
-  private readonly renderer: THREE.WebGLRenderer;
+  private readonly renderer: THREE.WebGPURenderer;
   private resizeObserver?: ResizeObserver;
   private player!: THREE.Group;
   /** The visible ship, banked inside the flight frame. */
@@ -1094,7 +1212,7 @@ class DogfightEngine {
   private cockpit!: THREE.Group;
   private sun!: THREE.DirectionalLight;
   private sunDisc!: THREE.Sprite;
-  private stars!: THREE.Points;
+  private stars!: THREE.Sprite;
   private asteroidMesh!: THREE.InstancedMesh;
   private playerLasers!: THREE.InstancedMesh;
   private enemyLasers!: THREE.InstancedMesh;
@@ -1176,7 +1294,7 @@ class DogfightEngine {
   private readonly renderSize = new THREE.Vector2();
 
   constructor(
-    renderer: THREE.WebGLRenderer,
+    renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
     camera: THREE.PerspectiveCamera,
     settings: GraphicsSettings,
@@ -1199,16 +1317,19 @@ class DogfightEngine {
     this.camera.updateProjectionMatrix();
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.45;
-    this.renderer.setClearColor(0x030b14, 1);
-    this.renderer.info.autoReset = !IS_DEVELOPMENT;
-    this.scene.fog = new THREE.FogExp2(0x06111d, 0.00052);
+    this.renderer.toneMappingExposure = TONE_MAPPING_EXPOSURE;
+    this.renderer.setClearColor(displayColor(SKY_COLOR), 1);
+    this.scene.fog = new THREE.FogExp2(displayColor(0x06111d), 0.00052);
 
     this.buildWorld();
     this.bindEvents();
     this.applySettings(settings);
     this.resize();
     this.attachQaControls();
+  }
+
+  private get backend(): RenderBackend {
+    return "isWebGPUBackend" in this.renderer.backend ? "webgpu" : "webgl2";
   }
 
   private attachQaControls() {
@@ -1276,6 +1397,7 @@ class DogfightEngine {
           status: this.status,
           quality: this.settings.quality,
           detail: this.modelDetail,
+          backend: this.backend,
           touchDevice: this.isTouchDevice,
           gyroPermission: this.gyroPermission,
           gyro: {
@@ -1387,7 +1509,6 @@ class DogfightEngine {
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       fog: false,
-      toneMapped: false,
     });
 
     this.sunDisc = new THREE.Sprite(material);
@@ -1422,19 +1543,31 @@ class DogfightEngine {
       colors[index * 3 + 1] = tint * (random() > 0.82 ? 0.9 : 1);
       colors[index * 3 + 2] = tint;
     }
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-    geometry.setDrawRange(0, this.settings.starCount);
-    const material = new THREE.PointsMaterial({
-      size: 1.35,
-      sizeAttenuation: true,
-      vertexColors: true,
+    // WebGPU point primitives are always one pixel, so each star is an
+    // instanced sprite that grows as the ship closes on it.
+    const material = new THREE.PointsNodeMaterial({
+      sizeAttenuation: false,
       transparent: true,
       opacity: 0.9,
       depthWrite: false,
     });
-    this.stars = new THREE.Points(geometry, material);
+    material.positionNode = instancedBufferAttribute<"vec3">(
+      new THREE.InstancedBufferAttribute(positions, 3),
+    );
+    material.colorNode = instancedBufferAttribute<"vec3">(
+      new THREE.InstancedBufferAttribute(colors, 3),
+    );
+    // Attenuate by half the canvas height like point primitives do, but
+    // never below one device pixel, where a sprite would flicker out.
+    material.sizeNode = max(
+      float(STAR_SIZE)
+        .mul(screenSize.y.div(screenDPR).mul(0.5))
+        .div(positionView.z.negate()),
+      float(1).div(screenDPR),
+    );
+    this.stars = new THREE.Sprite(material);
+    this.stars.count = this.settings.starCount;
+    this.stars.frustumCulled = false;
     this.scene.add(this.stars);
   }
 
@@ -1549,12 +1682,10 @@ class DogfightEngine {
   private buildProjectilePool() {
     const geometry = new THREE.BoxGeometry(0.11, 0.11, 3.4);
     const friendlyMaterial = new THREE.MeshBasicMaterial({
-      color: 0x61ff8f,
-      toneMapped: false,
+      color: displayColor(0x61ff8f),
     });
     const enemyMaterial = new THREE.MeshBasicMaterial({
-      color: 0xff4b32,
-      toneMapped: false,
+      color: displayColor(0xff4b32),
     });
     this.playerLasers = new THREE.InstancedMesh(
       geometry,
@@ -1897,10 +2028,12 @@ class DogfightEngine {
       this.asteroidMesh.castShadow = settings.shadows && !this.isTouchDevice;
       this.rebuildAsteroidGrid();
     }
-    this.stars?.geometry.setDrawRange(
-      0,
-      Math.min(settings.starCount, this.isTouchDevice ? 3500 : settings.starCount),
-    );
+    if (this.stars) {
+      this.stars.count = Math.min(
+        settings.starCount,
+        this.isTouchDevice ? 3500 : settings.starCount,
+      );
+    }
     if (this.renderer) {
       this.renderer.shadowMap.enabled = settings.shadows && !this.isTouchDevice;
       this.renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -2913,7 +3046,7 @@ class DogfightEngine {
       damage: this.damageFlash,
       fps: this.fps,
       frameMs: this.frameMs,
-      drawCalls: this.renderer.info.render.calls,
+      drawCalls: this.renderer.info.render.drawCalls,
       triangles: this.renderer.info.render.triangles,
       renderScale: this.effectiveScale,
       diagnostics: this.diagnostics,
@@ -2993,7 +3126,9 @@ function GameRuntime({
   callbacks: GameCallbacks;
   engineRef: { current: DogfightEngine | null };
 }) {
-  const renderer = useThree((state) => state.gl) as THREE.WebGLRenderer;
+  const renderer = useThree(
+    (state) => state.gl,
+  ) as unknown as THREE.WebGPURenderer;
   const scene = useThree((state) => state.scene);
   const camera = useThree((state) => state.camera) as THREE.PerspectiveCamera;
   const runtimeRef = useRef<DogfightEngine | null>(null);
@@ -3003,11 +3138,20 @@ function GameRuntime({
     runtimeRef.current?.frame(state.clock.elapsedTime * 1000, delta);
   }, 1);
 
+  // The renderer's own loop steps react-three-fiber, so three's per-frame
+  // bookkeeping brackets every render. A manual frameloop reads seconds.
+  useEffect(() => {
+    void renderer.setAnimationLoop((time) => advance(time / 1000));
+    return () => {
+      void renderer.setAnimationLoop(null);
+    };
+  }, [renderer]);
+
   useEffect(() => {
     let cancelled = false;
     let localEngine: DogfightEngine | null = null;
 
-    if (!(renderer instanceof THREE.WebGLRenderer)) {
+    if (!(renderer instanceof THREE.WebGPURenderer)) {
       callbacks.onStatus("unsupported");
       return;
     }
@@ -3050,17 +3194,7 @@ function GameRuntime({
     runtimeRef.current?.applySettings(settings);
   }, [settings]);
 
-  return DevelopmentPerf ? (
-    <Suspense fallback={null}>
-      <DevelopmentPerf
-        className="development-r3f-perf"
-        position="top-left"
-        minimal
-        showGraph={false}
-        logsPerSecond={8}
-      />
-    </Suspense>
-  ) : null;
+  return null;
 }
 
 function SettingsPanel({
@@ -3606,9 +3740,7 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
       )}
 
       {hud.diagnostics && (
-        <div
-          className={`perf-panel ${IS_DEVELOPMENT ? "with-r3f-perf" : ""}`}
-        >
+        <div className="perf-panel">
           <div>
             <span>FPS</span>
             <b>{hud.fps.toFixed(0)}</b>
@@ -3652,6 +3784,10 @@ export function StarfighterGame() {
       onStatus: setStatus,
       onHighScore: setHighScore,
     }),
+    [],
+  );
+  const createRenderer = useMemo(
+    () => createRendererFactory(() => setStatus("unsupported")),
     [],
   );
 
@@ -3763,7 +3899,8 @@ export function StarfighterGame() {
         <Canvas
           camera={{ fov: 67, near: 0.1, far: 2200 }}
           dpr={1}
-          gl={createWebGL2Renderer}
+          frameloop="never"
+          gl={createRenderer}
         >
           <GameRuntime
             settings={settings}
@@ -3835,7 +3972,7 @@ export function StarfighterGame() {
               </button>
             </div>
             <footer className="menu-footer">
-              <span>WebGL2 // Desktop & Mobile gyro flight system</span>
+              <span>WebGPU // Desktop & Mobile gyro flight system</span>
               <span>{scoreLine}</span>
             </footer>
           </section>
@@ -3906,10 +4043,11 @@ export function StarfighterGame() {
         <div className="overlay">
           <section className="pause-card unsupported">
             <span className="menu-kicker">Renderer unavailable</span>
-            <h2>WebGL2 required</h2>
+            <h2>WebGPU or WebGL2 required</h2>
             <p>
-              Rogue Vector supports WebGL2 on desktop and mobile browsers
-              (Chrome, Edge, Firefox, and Safari) with hardware acceleration enabled.
+              Rogue Vector renders with WebGPU and falls back to WebGL2 on
+              desktop and mobile browsers (Chrome, Edge, Firefox, and Safari)
+              with hardware acceleration enabled.
             </p>
           </section>
         </div>
