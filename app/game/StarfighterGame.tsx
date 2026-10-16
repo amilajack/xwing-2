@@ -17,6 +17,18 @@ import {
 } from "@react-three/fiber";
 import * as THREE from "three";
 import { deviceTiltFromOrientation, type DeviceTilt } from "./deviceTilt";
+import {
+  BARREL_ROLL_COOLDOWN,
+  BARREL_ROLL_DEFLECT_RADIUS,
+  BRAKE_SPEED_FACTOR,
+  BRAKE_TURN_FACTOR,
+  isDoubleTap,
+  MANEUVER_DURATION,
+  MANEUVER_METER_COST,
+  maneuverPose,
+  type ManeuverKind,
+  type ManeuverPose,
+} from "./maneuvers";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 declare global {
@@ -26,6 +38,12 @@ declare global {
       simulateGyro: (beta: number, gamma: number) => void;
       steerForSteps: (steerX: number, steerY: number, steps: number) => void;
       boostForSteps: (steps: number) => number;
+      brakeForSteps: (steps: number) => number;
+      maneuver: (kind: ManeuverKind, direction?: -1 | 1) => boolean;
+      /** Fires an enemy bolt at the player from `distance` dead ahead. */
+      fireAtPlayer: (distance: number) => void;
+      /** Flies the player and moves bolts, with no enemies acting. */
+      flyForSteps: (steps: number) => void;
       snapshot: () => {
         status: GameStatus;
         quality: QualityName;
@@ -38,6 +56,12 @@ declare global {
         speed: number;
         boostActive: boolean;
         boostRemaining: number;
+        braking: boolean;
+        maneuver: ManeuverKind | null;
+        barrelRollCooldown: number;
+        deflecting: boolean;
+        deflections: number;
+        shields: number;
         sideways: boolean;
         playerPosition: [number, number, number];
         playerForward: [number, number, number];
@@ -122,6 +146,8 @@ type HudSnapshot = {
   engineRamp: number;
   boost: number;
   boostActive: boolean;
+  brakeActive: boolean;
+  maneuver: string;
   wave: number;
   score: number;
   enemies: number;
@@ -228,6 +254,7 @@ const DevelopmentPerf =
       )
     : null;
 const FIXED_STEP = 1 / 60;
+const NO_FLIGHT_INPUT: FlightInput = { fire: false, boost: false };
 const MAX_ENEMIES = 20;
 const MAX_PROJECTILES = 320;
 const MAX_EXPLOSIONS = 32;
@@ -303,6 +330,8 @@ const EMPTY_HUD: HudSnapshot = {
   engineRamp: 0,
   boost: 100,
   boostActive: false,
+  brakeActive: false,
+  maneuver: "READY",
   wave: 1,
   score: 0,
   enemies: 0,
@@ -929,6 +958,20 @@ type Enemy = {
   radius: number;
 };
 
+type FlightInput = {
+  fire: boolean;
+  boost: boolean;
+  brake?: boolean;
+};
+
+type ActiveManeuver = {
+  kind: ManeuverKind;
+  direction: -1 | 1;
+  elapsed: number;
+  /** The pose reached so far, to take each step's change from. */
+  pose: ManeuverPose;
+};
+
 type Projectile = {
   active: boolean;
   friendly: boolean;
@@ -1058,6 +1101,62 @@ class SynthAudio {
     source.stop(now + (large ? 0.5 : 0.18));
   }
 
+  /** Air rushing past a roll, or a longer one for a loop. */
+  whoosh(long = false) {
+    if (!this.context || !this.master || !this.noise || this.muted) return;
+    const source = this.context.createBufferSource();
+    const filter = this.context.createBiquadFilter();
+    const gain = this.context.createGain();
+    const now = this.context.currentTime;
+    const length = long ? 0.55 : 0.4;
+    source.buffer = this.noise;
+    filter.type = "bandpass";
+    filter.Q.value = 1.4;
+    filter.frequency.setValueAtTime(420, now);
+    filter.frequency.exponentialRampToValueAtTime(1800, now + length * 0.5);
+    filter.frequency.exponentialRampToValueAtTime(520, now + length);
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.exponentialRampToValueAtTime(0.09, now + length * 0.4);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + length);
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.master);
+    source.start(now);
+    source.stop(now + length + 0.02);
+  }
+
+  /** A bright ping for a bolt swatted away mid-roll. */
+  deflect() {
+    this.tone("triangle", 1500, 2600, 0.06, 0.14);
+  }
+
+  /** A dull blip when the reservoir can't pay for a maneuver. */
+  denied() {
+    this.tone("square", 180, 120, 0.04, 0.12);
+  }
+
+  private tone(
+    type: OscillatorType,
+    from: number,
+    to: number,
+    level: number,
+    length: number,
+  ) {
+    if (!this.context || !this.master || this.muted) return;
+    const oscillator = this.context.createOscillator();
+    const gain = this.context.createGain();
+    const now = this.context.currentTime;
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(from, now);
+    oscillator.frequency.exponentialRampToValueAtTime(to, now + length);
+    gain.gain.setValueAtTime(level, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + length);
+    oscillator.connect(gain);
+    gain.connect(this.master);
+    oscillator.start(now);
+    oscillator.stop(now + length + 0.01);
+  }
+
   suspend() {
     void this.context?.suspend();
   }
@@ -1136,6 +1235,26 @@ class DogfightEngine {
   private boostActive = false;
   private boostLocked = false;
   private boostBlend = 0;
+  private brakeActive = false;
+  private brakeBlend = 0;
+  private maneuver: ActiveManeuver | null = null;
+  private pendingManeuver: {
+    kind: ManeuverKind;
+    direction: -1 | 1;
+  } | null = null;
+  private readonly maneuverStep: ManeuverPose = {
+    pitch: 0,
+    roll: 0,
+    lateral: 0,
+  };
+  /** The barrel roll's spin of the model, on top of the bank. */
+  private maneuverRoll = 0;
+  private barrelRollCooldown = 0;
+  private deflections = 0;
+  private lastArrowTap = { ArrowLeft: -10, ArrowRight: -10 };
+  private lastUturnChord = false;
+  private lastGamepadRoll = { left: false, right: false };
+  private lastGamepadSomersault = false;
   private readonly angularVelocity = new THREE.Vector3();
   private shields = 100;
   private hull = 100;
@@ -1228,7 +1347,7 @@ class DogfightEngine {
         this.mouseYPercent = clamp(steerY, -1, 1);
         const boundedSteps = clamp(Math.floor(steps), 1, 360);
         for (let step = 0; step < boundedSteps; step += 1) {
-          this.updatePlayer(FIXED_STEP, { fire: false, boost: false });
+          this.updatePlayer(FIXED_STEP, NO_FLIGHT_INPUT);
         }
       },
       // Holds the burner down for `steps` fixed updates and reports the
@@ -1243,6 +1362,45 @@ class DogfightEngine {
           longestRun = Math.max(longestRun, currentRun);
         }
         return longestRun * FIXED_STEP;
+      },
+      // Holds the brake for `steps` fixed updates and reports the slowest
+      // speed reached.
+      brakeForSteps: (steps) => {
+        const boundedSteps = clamp(Math.floor(steps), 1, 6000);
+        let slowest = Infinity;
+        for (let step = 0; step < boundedSteps; step += 1) {
+          this.updatePlayer(FIXED_STEP, {
+            fire: false,
+            boost: false,
+            brake: true,
+          });
+          slowest = Math.min(slowest, this.speed);
+        }
+        return slowest;
+      },
+      maneuver: (kind, direction = 1) => this.startManeuver(kind, direction),
+      fireAtPlayer: (distance) => {
+        const forward = this.tempV1
+          .copy(LOCAL_FORWARD)
+          .applyQuaternion(this.player.quaternion);
+        const position = this.tempV2
+          .copy(this.player.position)
+          .addScaledVector(forward, distance);
+        this.spawnProjectile(
+          false,
+          position,
+          this.tempV3.copy(forward).multiplyScalar(-205),
+          14,
+          3.4,
+        );
+      },
+      flyForSteps: (steps) => {
+        const boundedSteps = clamp(Math.floor(steps), 1, 6000);
+        for (let step = 0; step < boundedSteps; step += 1) {
+          this.elapsed += FIXED_STEP;
+          this.updatePlayer(FIXED_STEP, NO_FLIGHT_INPUT);
+          this.updateProjectiles(FIXED_STEP);
+        }
       },
       snapshot: () => {
         const activeEnemies = {
@@ -1290,6 +1448,12 @@ class DogfightEngine {
           speed: this.speed,
           boostActive: this.boostActive,
           boostRemaining: this.boostRemaining,
+          braking: this.brakeActive,
+          maneuver: this.maneuver?.kind ?? null,
+          barrelRollCooldown: this.barrelRollCooldown,
+          deflecting: this.barrelRolling(),
+          deflections: this.deflections,
+          shields: this.shields,
           sideways: this.sideways,
           bankRoll: this.bankRoll,
           phoneBankRoll: this.phoneBankRoll,
@@ -1804,10 +1968,32 @@ class DogfightEngine {
     if (event.code === "Space" && this.status === "playing") {
       this.toggleSideways();
     }
+    if (this.status === "playing") this.queueKeyboardManeuver(event.code);
     if (event.code === "KeyP") {
       this.diagnostics = !this.diagnostics;
     }
   };
+
+  private queueKeyboardManeuver(code: string) {
+    if (code === "KeyQ") {
+      this.pendingManeuver = { kind: "barrelRoll", direction: -1 };
+    } else if (code === "KeyE") {
+      this.pendingManeuver = { kind: "barrelRoll", direction: 1 };
+    } else if (code === "KeyW") {
+      this.pendingManeuver = { kind: "somersault", direction: 1 };
+    } else if (code === "ArrowLeft" || code === "ArrowRight") {
+      // Two quick taps of an arrow roll that way, as in Star Fox.
+      if (isDoubleTap(this.lastArrowTap[code], this.elapsed)) {
+        this.pendingManeuver = {
+          kind: "barrelRoll",
+          direction: code === "ArrowLeft" ? -1 : 1,
+        };
+        this.lastArrowTap[code] = -10;
+      } else {
+        this.lastArrowTap[code] = this.elapsed;
+      }
+    }
+  }
 
   private onKeyUp = (event: KeyboardEvent) => {
     this.keys.delete(event.code);
@@ -2025,6 +2211,15 @@ class DogfightEngine {
     this.boostActive = false;
     this.boostLocked = false;
     this.boostBlend = 0;
+    this.brakeActive = false;
+    this.brakeBlend = 0;
+    this.maneuver = null;
+    this.pendingManeuver = null;
+    this.maneuverRoll = 0;
+    this.barrelRollCooldown = 0;
+    this.deflections = 0;
+    this.lastArrowTap = { ArrowLeft: -10, ArrowRight: -10 };
+    this.lastUturnChord = false;
     this.angularVelocity.set(0, 0, 0);
     this.shields = 100;
     this.hull = 100;
@@ -2241,6 +2436,7 @@ class DogfightEngine {
       this.touchBoost ||
       this.keys.has("ShiftLeft") ||
       this.keys.has("ShiftRight");
+    let brake = this.keys.has("KeyS");
 
     const gamepads = navigator.getGamepads?.() ?? [];
     const gamepad = Array.from(gamepads).find(
@@ -2257,6 +2453,21 @@ class DogfightEngine {
       }
       fire ||= (gamepad.buttons[7]?.value ?? 0) > 0.25;
       boost ||= (gamepad.buttons[6]?.value ?? 0) > 0.25;
+      brake ||= Boolean(gamepad.buttons[1]?.pressed);
+      const rollLeft = Boolean(gamepad.buttons[4]?.pressed);
+      const rollRight = Boolean(gamepad.buttons[5]?.pressed);
+      if (rollLeft && !this.lastGamepadRoll.left) {
+        this.pendingManeuver = { kind: "barrelRoll", direction: -1 };
+      } else if (rollRight && !this.lastGamepadRoll.right) {
+        this.pendingManeuver = { kind: "barrelRoll", direction: 1 };
+      }
+      this.lastGamepadRoll.left = rollLeft;
+      this.lastGamepadRoll.right = rollRight;
+      const somersault = Boolean(gamepad.buttons[2]?.pressed);
+      if (somersault && !this.lastGamepadSomersault) {
+        this.pendingManeuver = { kind: "somersault", direction: 1 };
+      }
+      this.lastGamepadSomersault = somersault;
       const sidewaysPressed = Boolean(gamepad.buttons[0]?.pressed);
       if (sidewaysPressed && !this.lastGamepadSideways) this.toggleSideways();
       this.lastGamepadSideways = sidewaysPressed;
@@ -2266,25 +2477,42 @@ class DogfightEngine {
     } else {
       this.lastGamepadCamera = false;
       this.lastGamepadSideways = false;
+      this.lastGamepadRoll.left = false;
+      this.lastGamepadRoll.right = false;
+      this.lastGamepadSomersault = false;
     }
+
+    // Brake and boost together, as in Star Fox, turn the ship around.
+    const uturnChord = boost && brake;
+    if (uturnChord && !this.lastUturnChord) {
+      this.pendingManeuver = { kind: "uturn", direction: 1 };
+    }
+    this.lastUturnChord = uturnChord;
 
     this.mouseXPercent = clamp(this.mouseXPercent, -1, 1);
     this.mouseYPercent = clamp(this.mouseYPercent, -1, 1);
-    return { fire, boost };
+    return { fire, boost, brake };
   }
 
-  private updateBoost(delta: number, held: boolean) {
+  // Boost and brake both burn the afterburner reservoir: the brake is the
+  // burner fired against the direction of travel. Holding both at once is the
+  // U-turn chord, so it fires neither.
+  private updateThrottle(delta: number, boostHeld: boolean, brakeHeld: boolean) {
+    const held = boostHeld !== brakeHeld;
     if (held && !this.boostLocked && this.boostRemaining > 0) {
-      this.boostActive = true;
+      this.boostActive = boostHeld;
+      this.brakeActive = brakeHeld;
       this.boostRemaining = Math.max(0, this.boostRemaining - delta);
       // Draining to empty locks the burner out until the reservoir has
       // recovered, so the pilot cannot chain two full-length burns.
       if (this.boostRemaining === 0) {
         this.boostActive = false;
+        this.brakeActive = false;
         this.boostLocked = true;
       }
     } else {
       this.boostActive = false;
+      this.brakeActive = false;
       this.boostRemaining = Math.min(
         BOOST_MAX_SECONDS,
         this.boostRemaining + delta * BOOST_RECHARGE_PER_SECOND,
@@ -2300,15 +2528,100 @@ class DogfightEngine {
       BOOST_RESPONSE,
       delta,
     );
+    this.brakeBlend = THREE.MathUtils.damp(
+      this.brakeBlend,
+      this.brakeActive ? 1 : 0,
+      BOOST_RESPONSE,
+      delta,
+    );
   }
 
-  private updatePlayer(delta: number, input: { fire: boolean; boost: boolean }) {
+  /**
+   * Starts a maneuver if the ship is free to fly one and the reservoir can
+   * pay for it. Returns whether it started.
+   */
+  private startManeuver(kind: ManeuverKind, direction: -1 | 1 = 1) {
+    if (this.maneuver) return false;
+    if (kind === "barrelRoll" && this.barrelRollCooldown > 0) return false;
+    const cost = MANEUVER_METER_COST[kind];
+    if (cost > 0 && (this.boostLocked || this.boostRemaining < cost)) {
+      this.audio.denied();
+      return false;
+    }
+    this.boostRemaining -= cost;
+    if (cost > 0 && this.boostRemaining <= 0) {
+      this.boostRemaining = 0;
+      this.boostLocked = true;
+    }
+    if (kind === "barrelRoll") this.barrelRollCooldown = BARREL_ROLL_COOLDOWN;
+    this.maneuver = {
+      kind,
+      direction,
+      elapsed: 0,
+      pose: maneuverPose(kind, 0),
+    };
+    this.audio.whoosh(kind !== "barrelRoll");
+    return true;
+  }
+
+  /** True while a somersault or U-turn has taken the stick away. */
+  private scriptedManeuverActive() {
+    return this.maneuver !== null && this.maneuver.kind !== "barrelRoll";
+  }
+
+  private barrelRolling() {
+    return this.maneuver?.kind === "barrelRoll";
+  }
+
+  /**
+   * Advances the active maneuver and returns how far it moved this step:
+   * pitch and roll for the flight frame, and the sideways jink.
+   */
+  private advanceManeuver(delta: number) {
+    const step = this.maneuverStep;
+    step.pitch = 0;
+    step.roll = 0;
+    step.lateral = 0;
+    if (!this.maneuver) return step;
+    const maneuver = this.maneuver;
+    maneuver.elapsed += delta;
+    const t = Math.min(1, maneuver.elapsed / MANEUVER_DURATION[maneuver.kind]);
+    const pose = maneuverPose(maneuver.kind, t);
+    step.pitch = pose.pitch - maneuver.pose.pitch;
+    step.roll = (pose.roll - maneuver.pose.roll) * maneuver.direction;
+    step.lateral = (pose.lateral - maneuver.pose.lateral) * maneuver.direction;
+    maneuver.pose = pose;
+    if (t >= 1) this.maneuver = null;
+    return step;
+  }
+
+  private updatePlayer(delta: number, input: FlightInput) {
     this.speedMultiplier = Math.min(9, this.speedMultiplier + 0.001);
-    this.updateBoost(delta, input.boost);
+    this.barrelRollCooldown = Math.max(0, this.barrelRollCooldown - delta);
+    if (this.pendingManeuver) {
+      this.startManeuver(
+        this.pendingManeuver.kind,
+        this.pendingManeuver.direction,
+      );
+      this.pendingManeuver = null;
+    }
+    const scripted = this.scriptedManeuverActive();
+    // A loop or U-turn flies at whatever throttle it started with.
+    this.updateThrottle(
+      delta,
+      !scripted && input.boost,
+      !scripted && Boolean(input.brake),
+    );
     this.speed =
       this.speedMultiplier *
       REFERENCE_SPEED_SCALE *
-      (1 + this.boostBlend * (BOOST_SPEED_FACTOR - 1));
+      (1 + this.boostBlend * (BOOST_SPEED_FACTOR - 1)) *
+      THREE.MathUtils.lerp(1, BRAKE_SPEED_FACTOR, this.brakeBlend);
+    const turnFactor = THREE.MathUtils.lerp(
+      1,
+      BRAKE_TURN_FACTOR,
+      this.brakeBlend,
+    );
 
     const previousProfileRotation = this.sidewaysRotation;
     if (this.sidewaysTween < 1) {
@@ -2324,8 +2637,14 @@ class DogfightEngine {
       );
     }
 
-    const targetPitchRate = -this.mouseYPercent * MAX_PITCH_RATE;
-    const targetYawRate = -this.mouseXPercent * MAX_YAW_RATE;
+    // A loop or U-turn takes the stick away, and the turn rates settle to
+    // nothing so control comes back smoothly when the maneuver ends.
+    const targetPitchRate = scripted
+      ? 0
+      : -this.mouseYPercent * MAX_PITCH_RATE * turnFactor;
+    const targetYawRate = scripted
+      ? 0
+      : -this.mouseXPercent * MAX_YAW_RATE * turnFactor;
     this.angularVelocity.x = THREE.MathUtils.damp(
       this.angularVelocity.x,
       targetPitchRate,
@@ -2353,16 +2672,35 @@ class DogfightEngine {
             BANK_ROLL_RESPONSE,
             delta,
           );
-    this.playerModel.rotation.z = this.bankRoll;
+    const rolling = this.barrelRolling();
+    const maneuverStep = this.advanceManeuver(delta);
+    // A barrel roll spins the model, not the flight frame, like the bank: the
+    // ship keeps flying where it was aimed while it rolls. Rolling right is a
+    // negative turn about the roll axis, as the bank is.
+    if (rolling && this.maneuver) {
+      this.maneuverRoll -= maneuverStep.roll;
+    } else {
+      this.maneuverRoll = 0;
+    }
+    this.playerModel.rotation.z = this.bankRoll + this.maneuverRoll;
 
     this.tempEuler.set(
-      this.angularVelocity.x * delta,
+      this.angularVelocity.x * delta + maneuverStep.pitch,
       this.angularVelocity.y * delta,
-      this.sidewaysRotation - previousProfileRotation,
+      this.sidewaysRotation -
+        previousProfileRotation +
+        (rolling ? 0 : maneuverStep.roll),
       "XYZ",
     );
     this.tempQ1.setFromEuler(this.tempEuler);
     this.player.quaternion.multiply(this.tempQ1).normalize();
+
+    if (maneuverStep.lateral !== 0) {
+      this.player.position.addScaledVector(
+        this.tempV1.set(1, 0, 0).applyQuaternion(this.player.quaternion),
+        maneuverStep.lateral,
+      );
+    }
 
     const playerForward = this.tempV1
       .copy(LOCAL_FORWARD)
@@ -2565,6 +2903,12 @@ class DogfightEngine {
           }
         }
       } else if (
+        this.barrelRolling() &&
+        projectile.position.distanceToSquared(this.player.position) <
+          BARREL_ROLL_DEFLECT_RADIUS * BARREL_ROLL_DEFLECT_RADIUS
+      ) {
+        this.deflectProjectile(projectile);
+      } else if (
         projectile.position.distanceToSquared(this.player.position) <
         3.4 * 3.4
       ) {
@@ -2573,6 +2917,23 @@ class DogfightEngine {
         this.damagePlayer(projectile.damage);
       }
     }
+  }
+
+  /**
+   * Swats an enemy bolt back the way it came, now the player's own, so it
+   * can strike whoever fired it.
+   */
+  private deflectProjectile(projectile: Projectile) {
+    projectile.friendly = true;
+    projectile.velocity.negate();
+    this.tempV1
+      .randomDirection()
+      .multiplyScalar(projectile.velocity.length() * 0.08);
+    projectile.velocity.add(this.tempV1);
+    projectile.life = 2.4;
+    this.deflections += 1;
+    this.spawnExplosion(projectile.position, 2.2);
+    this.audio.deflect();
   }
 
   private destroyEnemy(enemy: Enemy) {
@@ -2781,7 +3142,10 @@ class DogfightEngine {
       this.camera.quaternion
         .copy(this.player.quaternion)
         .multiply(
-          this.tempQ1.setFromAxisAngle(LOCAL_ROLL_AXIS, this.bankRoll),
+          this.tempQ1.setFromAxisAngle(
+            LOCAL_ROLL_AXIS,
+            this.bankRoll + this.maneuverRoll,
+          ),
         );
       this.camera.up.set(0, 1, 0);
     }
@@ -2843,6 +3207,20 @@ class DogfightEngine {
     return target;
   }
 
+  private maneuverLabel() {
+    switch (this.maneuver?.kind) {
+      case "barrelRoll":
+        return "BARREL ROLL";
+      case "somersault":
+        return "SOMERSAULT";
+      case "uturn":
+        return "U-TURN";
+    }
+    if (this.brakeActive) return "BRAKE";
+    if (this.barrelRollCooldown > 0) return "ROLL COOLDOWN";
+    return "READY";
+  }
+
   private publishHud() {
     if (!this.renderer) return;
     const radar: RadarContact[] = [];
@@ -2893,6 +3271,8 @@ class DogfightEngine {
       engineRamp: clamp(((this.speedMultiplier - 4) / 5) * 100, 0, 100),
       boost: clamp((this.boostRemaining / BOOST_MAX_SECONDS) * 100, 0, 100),
       boostActive: this.boostActive,
+      brakeActive: this.brakeActive,
+      maneuver: this.maneuverLabel(),
       wave: this.wave,
       score: this.score,
       enemies: this.activeEnemyCount(),
@@ -3348,6 +3728,22 @@ function ControlsPanel({
               <kbd>Shift (10s hold)</kbd>
             </div>
             <div className="control-line">
+              <span>Brake</span>
+              <kbd>Hold S</kbd>
+            </div>
+            <div className="control-line">
+              <span>Barrel roll</span>
+              <kbd>Q / E or double-tap ← / →</kbd>
+            </div>
+            <div className="control-line">
+              <span>Somersault</span>
+              <kbd>W</kbd>
+            </div>
+            <div className="control-line">
+              <span>U-turn</span>
+              <kbd>S + Shift</kbd>
+            </div>
+            <div className="control-line">
               <span>Camera / diag</span>
               <kbd>C / P</kbd>
             </div>
@@ -3370,6 +3766,22 @@ function ControlsPanel({
             <div className="control-line">
               <span>Afterburner</span>
               <kbd>LT</kbd>
+            </div>
+            <div className="control-line">
+              <span>Brake</span>
+              <kbd>B</kbd>
+            </div>
+            <div className="control-line">
+              <span>Barrel roll</span>
+              <kbd>LB / RB</kbd>
+            </div>
+            <div className="control-line">
+              <span>Somersault</span>
+              <kbd>X</kbd>
+            </div>
+            <div className="control-line">
+              <span>U-turn</span>
+              <kbd>B + LT</kbd>
             </div>
             <div className="control-line">
               <span>Camera</span>
@@ -3467,7 +3879,9 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
           <strong>{(hud.boost * 0.1).toFixed(1)}s</strong>
         </div>
         <div
-          className={`meter${hud.boostActive ? " meter-active" : ""}`}
+          className={`meter${
+            hud.boostActive || hud.brakeActive ? " meter-active" : ""
+          }`}
           style={{ "--bar": "#ff6b3d" } as React.CSSProperties}
         >
           <span style={{ "--value": `${hud.boost}%` } as React.CSSProperties} />
@@ -3475,6 +3889,10 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
         <div className="system-label">
           <span>Velocity</span>
           <strong>{Math.round(hud.speed)} M/S</strong>
+        </div>
+        <div className="system-label">
+          <span>Maneuver</span>
+          <strong>{hud.maneuver}</strong>
         </div>
       </div>
 
