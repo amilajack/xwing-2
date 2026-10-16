@@ -56,8 +56,16 @@ function installBrowserStandIns() {
   const context2d = new Proxy(
     {},
     {
-      get: (_, key) =>
-        key.startsWith?.("create") ? () => ({ addColorStop: ignore }) : ignore,
+      get: (_, key) => {
+        if (key === "getImageData") {
+          return (_x, _y, width, height) => ({
+            data: new Uint8ClampedArray(width * height * 4),
+          });
+        }
+        return key.startsWith?.("create")
+          ? () => ({ addColorStop: ignore })
+          : ignore;
+      },
     },
   );
 
