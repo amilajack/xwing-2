@@ -297,6 +297,19 @@ const PLAYER_HIT_RADIUS = 3.4;
 // Scales on enemy cruise speed and on how hard they turn and weave.
 const ENEMY_SPEED_SCALE = 0.65;
 const ENEMY_AGILITY_SCALE = 0.75;
+// The asteroid field repeats with the period the arena wraps at, so wrapping
+// shows exactly the view the ship left. Copies of it are drawn out to the
+// view distance and fade into the background well before they reach it.
+const ASTEROID_FIELD_PERIOD = ARENA_HALF_EXTENT * 2;
+const ASTEROID_VIEW_DISTANCE = 1300;
+const ASTEROID_FADE_START = 900;
+const ASTEROID_FADE_END = ASTEROID_VIEW_DISTANCE - 30;
+// Copies this close are drawn even off screen, so they still cast shadows.
+const ASTEROID_SHADOW_CASTER_DISTANCE = 260;
+const ASTEROID_GRID_CELLS = 12;
+const ASTEROID_GRID_CELL = ASTEROID_FIELD_PERIOD / ASTEROID_GRID_CELLS;
+const MAX_ASTEROID_INSTANCES = 2048;
+const BACKGROUND_COLOR = 0x030b14;
 const SUN_DIRECTION = new THREE.Vector3(-180, 240, 160).normalize();
 const SUN_RENDER_DISTANCE = 1200;
 const SUN_SPRITE_DIAMETER = 400;
@@ -1009,7 +1022,53 @@ type Explosion = {
 type Asteroid = {
   position: THREE.Vector3;
   radius: number;
+  matrix: THREE.Matrix4;
 };
+
+/** Shortest offset between two coordinates in the repeating asteroid field. */
+function wrapFieldOffset(offset: number) {
+  return offset - ASTEROID_FIELD_PERIOD * Math.round(offset / ASTEROID_FIELD_PERIOD);
+}
+
+function wrapGridCell(cell: number) {
+  return ((cell % ASTEROID_GRID_CELLS) + ASTEROID_GRID_CELLS) % ASTEROID_GRID_CELLS;
+}
+
+/**
+ * Blends asteroids into the background color as they near the view
+ * distance, so copies of the field can come and go there unseen.
+ */
+function fadeAsteroidsWithDistance(material: THREE.Material) {
+  const background = [16, 8, 0]
+    .map((shift) => (((BACKGROUND_COLOR >> shift) & 255) / 255).toFixed(4))
+    .join(", ");
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nvarying float vAsteroidDistance;",
+      )
+      .replace(
+        "#include <fog_vertex>",
+        "#include <fog_vertex>\nvAsteroidDistance = length(mvPosition.xyz);",
+      );
+    // Runs after tone mapping and color-space output, so it lands on the
+    // same on-screen color as the cleared background.
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nvarying float vAsteroidDistance;",
+      )
+      .replace(
+        "#include <fog_fragment>",
+        `#include <fog_fragment>
+        float asteroidFade = smoothstep(${ASTEROID_FADE_START.toFixed(1)}, ${ASTEROID_FADE_END.toFixed(1)}, vAsteroidDistance);
+        if (asteroidFade > 0.995) discard;
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(${background}), asteroidFade);`,
+      );
+  };
+  material.customProgramCacheKey = () => "asteroid-distance-fade";
+}
 
 class SynthAudio {
   private context?: AudioContext;
@@ -1219,6 +1278,10 @@ class DogfightEngine {
   private explosions: Explosion[] = [];
   private asteroids: Asteroid[] = [];
   private asteroidGrid = new Map<string, number[]>();
+  private activeAsteroidCount = 0;
+  private readonly nearestAsteroid = { position: new THREE.Vector3(), radius: 0 };
+  private readonly asteroidFrustum = new THREE.Frustum();
+  private readonly asteroidSphere = new THREE.Sphere();
   private settings: GraphicsSettings;
   private modelDetail: "high" | "low";
   private status: GameStatus = "menu";
@@ -1580,6 +1643,9 @@ class DogfightEngine {
   }
 
   private updateSunPlacement() {
+    // Stars are a backdrop: they ride with the camera, so a wrap can't move them.
+    this.stars.position.copy(this.camera.position);
+
     this.sunDisc.position
       .copy(this.camera.position)
       .addScaledVector(SUN_DIRECTION, SUN_RENDER_DISTANCE);
@@ -1625,31 +1691,33 @@ class DogfightEngine {
   private buildAsteroids() {
     const geometry = this.modelLibrary.asteroid.geometry;
     const material = this.modelLibrary.asteroid.material;
-    this.asteroidMesh = new THREE.InstancedMesh(geometry, material, 560);
-    this.asteroidMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    (Array.isArray(material) ? material : [material]).forEach(
+      fadeAsteroidsWithDistance,
+    );
+    this.asteroidMesh = new THREE.InstancedMesh(
+      geometry,
+      material,
+      MAX_ASTEROID_INSTANCES,
+    );
+    this.asteroidMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.asteroidMesh.castShadow = true;
     this.asteroidMesh.receiveShadow = true;
-    this.asteroidMesh.frustumCulled = true;
+    // The visible copies are chosen against the camera every frame instead.
+    this.asteroidMesh.frustumCulled = false;
+    this.asteroidMesh.count = 0;
 
     const random = seededRandom(9917);
     for (let index = 0; index < 560; index += 1) {
       let x = 0;
       let y = 0;
       let z = 0;
-      let distance = 0;
       do {
-        x = (random() - 0.5) * 1450;
-        y = (random() - 0.5) * 1450;
-        z = (random() - 0.5) * 1450;
-        distance = Math.hypot(x, y, z);
-      } while (distance < 95 || distance > 830);
+        x = (random() - 0.5) * ASTEROID_FIELD_PERIOD;
+        y = (random() - 0.5) * ASTEROID_FIELD_PERIOD;
+        z = (random() - 0.5) * ASTEROID_FIELD_PERIOD;
+      } while (Math.hypot(x, y, z) < 95);
       const radius = 3.5 + Math.pow(random(), 1.8) * 16;
-      const asteroid: Asteroid = {
-        position: new THREE.Vector3(x, y, z),
-        radius,
-      };
-      this.asteroids.push(asteroid);
-      this.tempObject.position.copy(asteroid.position);
+      this.tempObject.position.set(x, y, z);
       this.tempObject.rotation.set(
         random() * Math.PI,
         random() * Math.PI,
@@ -1661,11 +1729,81 @@ class DogfightEngine {
         radius * (0.72 + random() * 0.48),
       );
       this.tempObject.updateMatrix();
-      this.asteroidMesh.setMatrixAt(index, this.tempObject.matrix);
+      this.asteroids.push({
+        position: new THREE.Vector3(x, y, z),
+        radius,
+        matrix: this.tempObject.matrix.clone(),
+      });
     }
-    this.asteroidMesh.instanceMatrix.needsUpdate = true;
     this.scene.add(this.asteroidMesh);
     this.rebuildAsteroidGrid();
+  }
+
+  /**
+   * Draws each copy of the repeating field that sits within the view
+   * distance and in the camera's view, against the camera of the frame about
+   * to be drawn, so turning can never reveal a gap.
+   */
+  private updateAsteroidInstances() {
+    const camera = this.camera;
+    camera.updateMatrixWorld();
+    this.asteroidFrustum.setFromProjectionMatrix(
+      this.tempMatrix.multiplyMatrices(
+        camera.projectionMatrix,
+        camera.matrixWorldInverse,
+      ),
+    );
+    const eye = camera.position;
+    const reach = ASTEROID_VIEW_DISTANCE;
+    const period = ASTEROID_FIELD_PERIOD;
+    const matrices = this.asteroidMesh.instanceMatrix.array as Float32Array;
+    const sphere = this.asteroidSphere;
+    let count = 0;
+    for (let index = 0; index < this.activeAsteroidCount; index += 1) {
+      const asteroid = this.asteroids[index];
+      const base = asteroid.position;
+      const firstX = Math.ceil((eye.x - reach - base.x) / period);
+      const lastX = Math.floor((eye.x + reach - base.x) / period);
+      const firstY = Math.ceil((eye.y - reach - base.y) / period);
+      const lastY = Math.floor((eye.y + reach - base.y) / period);
+      const firstZ = Math.ceil((eye.z - reach - base.z) / period);
+      const lastZ = Math.floor((eye.z + reach - base.z) / period);
+      for (let copyX = firstX; copyX <= lastX; copyX += 1) {
+        for (let copyY = firstY; copyY <= lastY; copyY += 1) {
+          for (let copyZ = firstZ; copyZ <= lastZ; copyZ += 1) {
+            if (count >= MAX_ASTEROID_INSTANCES) break;
+            const offsetX = copyX * period;
+            const offsetY = copyY * period;
+            const offsetZ = copyZ * period;
+            sphere.center.set(
+              base.x + offsetX,
+              base.y + offsetY,
+              base.z + offsetZ,
+            );
+            const distanceSq = sphere.center.distanceToSquared(eye);
+            if (distanceSq > reach * reach) continue;
+            sphere.radius = asteroid.radius * 1.1;
+            if (
+              distanceSq >
+                ASTEROID_SHADOW_CASTER_DISTANCE * ASTEROID_SHADOW_CASTER_DISTANCE &&
+              !this.asteroidFrustum.intersectsSphere(sphere)
+            ) {
+              continue;
+            }
+            const offset = count * 16;
+            asteroid.matrix.toArray(matrices, offset);
+            matrices[offset + 12] += offsetX;
+            matrices[offset + 13] += offsetY;
+            matrices[offset + 14] += offsetZ;
+            count += 1;
+          }
+        }
+      }
+    }
+    this.asteroidMesh.count = count;
+    this.asteroidMesh.instanceMatrix.clearUpdateRanges();
+    this.asteroidMesh.instanceMatrix.addUpdateRange(0, count * 16);
+    this.asteroidMesh.instanceMatrix.needsUpdate = true;
   }
 
   private buildEnemyPool() {
@@ -2096,9 +2234,10 @@ class DogfightEngine {
       settings.renderScale,
     );
     if (this.asteroidMesh) {
-      this.asteroidMesh.count = Math.min(
+      this.activeAsteroidCount = Math.min(
         settings.asteroidCount,
         this.isTouchDevice ? 320 : settings.asteroidCount,
+        this.asteroids.length,
       );
       this.asteroidMesh.castShadow = settings.shadows && !this.isTouchDevice;
       this.rebuildAsteroidGrid();
@@ -2377,6 +2516,7 @@ class DogfightEngine {
 
     this.syncProjectileInstances();
     this.updateSunPlacement();
+    this.updateAsteroidInstances();
     this.renderer.render(this.scene, this.camera);
 
     if (this.frameSampleTime >= 0.75) {
@@ -3070,51 +3210,69 @@ class DogfightEngine {
 
   private rebuildAsteroidGrid() {
     this.asteroidGrid.clear();
-    const count = Math.min(
-      this.settings.asteroidCount,
-      this.asteroids.length,
-    );
-    for (let index = 0; index < count; index += 1) {
-      const asteroid = this.asteroids[index];
-      const key = this.gridKey(asteroid.position);
+    for (let index = 0; index < this.activeAsteroidCount; index += 1) {
+      const { position } = this.asteroids[index];
+      const key = this.gridKey(
+        Math.floor(position.x / ASTEROID_GRID_CELL),
+        Math.floor(position.y / ASTEROID_GRID_CELL),
+        Math.floor(position.z / ASTEROID_GRID_CELL),
+      );
       const list = this.asteroidGrid.get(key);
       if (list) list.push(index);
       else this.asteroidGrid.set(key, [index]);
     }
   }
 
-  private gridKey(position: THREE.Vector3) {
-    const cell = 110;
-    return `${Math.floor(position.x / cell)},${Math.floor(
-      position.y / cell,
-    )},${Math.floor(position.z / cell)}`;
+  private gridKey(cellX: number, cellY: number, cellZ: number) {
+    return `${wrapGridCell(cellX)},${wrapGridCell(cellY)},${wrapGridCell(cellZ)}`;
   }
 
+  /**
+   * The closest asteroid within `padding` of its surface, as the copy of it
+   * nearest `position` in the repeating field - so collisions work the same
+   * on both sides of the arena's wrap.
+   */
   private findNearbyAsteroid(position: THREE.Vector3, padding: number) {
-    const cell = 110;
-    const cx = Math.floor(position.x / cell);
-    const cy = Math.floor(position.y / cell);
-    const cz = Math.floor(position.z / cell);
+    const cx = Math.floor(position.x / ASTEROID_GRID_CELL);
+    const cy = Math.floor(position.y / ASTEROID_GRID_CELL);
+    const cz = Math.floor(position.z / ASTEROID_GRID_CELL);
     let closest: Asteroid | undefined;
     let closestDistance = Number.POSITIVE_INFINITY;
+    let closestX = 0;
+    let closestY = 0;
+    let closestZ = 0;
     for (let x = -1; x <= 1; x += 1) {
       for (let y = -1; y <= 1; y += 1) {
         for (let z = -1; z <= 1; z += 1) {
-          const indices = this.asteroidGrid.get(`${cx + x},${cy + y},${cz + z}`);
+          const indices = this.asteroidGrid.get(this.gridKey(cx + x, cy + y, cz + z));
           if (!indices) continue;
           for (const index of indices) {
             const asteroid = this.asteroids[index];
-            const distance = position.distanceToSquared(asteroid.position);
+            const offsetX = wrapFieldOffset(asteroid.position.x - position.x);
+            const offsetY = wrapFieldOffset(asteroid.position.y - position.y);
+            const offsetZ = wrapFieldOffset(asteroid.position.z - position.z);
+            const distance =
+              offsetX * offsetX + offsetY * offsetY + offsetZ * offsetZ;
             const threshold = asteroid.radius + padding;
             if (distance < threshold * threshold && distance < closestDistance) {
               closestDistance = distance;
               closest = asteroid;
+              closestX = offsetX;
+              closestY = offsetY;
+              closestZ = offsetZ;
             }
           }
         }
       }
     }
-    return closest;
+    if (!closest) return undefined;
+    this.nearestAsteroid.radius = closest.radius;
+    this.nearestAsteroid.position.set(
+      position.x + closestX,
+      position.y + closestY,
+      position.z + closestZ,
+    );
+    return this.nearestAsteroid;
   }
 
   private positionHitsAsteroid(position: THREE.Vector3, padding: number) {

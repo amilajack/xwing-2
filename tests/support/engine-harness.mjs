@@ -141,12 +141,12 @@ export const SETTINGS = {
   muted: true,
 };
 
-export function createEngine(DogfightEngine, renderer) {
+export function createEngine(DogfightEngine, renderer, settings = SETTINGS) {
   return new DogfightEngine(
     renderer,
     new THREE.Scene(),
     new THREE.PerspectiveCamera(),
-    SETTINGS,
+    settings,
     {
       high: shipModels(),
       low: shipModels(),
