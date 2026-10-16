@@ -29,6 +29,7 @@ import {
   type ManeuverKind,
   type ManeuverPose,
 } from "./maneuvers";
+import { leadTargetPoint, segmentHitsSphere } from "./combatMath";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 declare global {
@@ -157,6 +158,9 @@ type HudSnapshot = {
   targetVisible: boolean;
   targetLabel: string;
   targetDistance: number;
+  leadX: number;
+  leadY: number;
+  leadVisible: boolean;
   radar: RadarContact[];
   boundary: boolean;
   damage: number;
@@ -283,6 +287,16 @@ const BOOST_RESPONSE = 4.5;
 const BOOST_FOV_KICK = 14;
 const BOOST_CHASE_PULLBACK = 16;
 const PLAYER_XWING_VISUAL_SCALE = 5;
+// Player bolts converge on the locked target's range (or this default), so
+// both wingtip cannons hit what sits under the reticle.
+const BOLT_CONVERGENCE_DISTANCE = 250;
+const BOLT_CONVERGENCE_MIN_COS = Math.cos(THREE.MathUtils.degToRad(25));
+// When the target's lead point is this close to the nose, bolts aim at it.
+const AIM_ASSIST_COS = Math.cos(THREE.MathUtils.degToRad(3));
+const PLAYER_HIT_RADIUS = 3.4;
+// Scales on enemy cruise speed and on how hard they turn and weave.
+const ENEMY_SPEED_SCALE = 0.65;
+const ENEMY_AGILITY_SCALE = 0.75;
 const SUN_DIRECTION = new THREE.Vector3(-180, 240, 160).normalize();
 const SUN_RENDER_DISTANCE = 1200;
 const SUN_SPRITE_DIAMETER = 400;
@@ -341,6 +355,9 @@ const EMPTY_HUD: HudSnapshot = {
   targetVisible: false,
   targetLabel: "",
   targetDistance: 0,
+  leadX: 50,
+  leadY: 50,
+  leadVisible: false,
   radar: [],
   boundary: false,
   damage: 0,
@@ -1287,6 +1304,9 @@ class DogfightEngine {
   private readonly tempV1 = new THREE.Vector3();
   private readonly tempV2 = new THREE.Vector3();
   private readonly tempV3 = new THREE.Vector3();
+  private readonly tempV4 = new THREE.Vector3();
+  private readonly tempV5 = new THREE.Vector3();
+  private readonly tempV6 = new THREE.Vector3();
   private readonly tempQ1 = new THREE.Quaternion();
   private readonly tempEuler = new THREE.Euler();
   private readonly tempMatrix = new THREE.Matrix4();
@@ -1667,7 +1687,7 @@ class DogfightEngine {
           cooldown: 0,
           burst: 0,
           phase: Math.random() * Math.PI * 2,
-          radius: kind === "bomber" ? 5.5 : 2.4,
+          radius: kind === "bomber" ? 6.3 : 4.2,
         });
         id += 1;
       }
@@ -2280,14 +2300,14 @@ class DogfightEngine {
 
   private activateEnemy(enemy: Enemy) {
     const healthByKind = {
-      fighter: 48 + this.wave * 2,
-      interceptor: 36 + this.wave * 1.5,
+      fighter: 40 + this.wave * 1.5,
+      interceptor: 28 + this.wave,
       bomber: 132 + this.wave * 4,
     };
     const speedByKind = {
-      fighter: 67 + Math.min(this.wave, 8) * 1.4,
-      interceptor: 94 + Math.min(this.wave, 8) * 1.7,
-      bomber: 49 + Math.min(this.wave, 8),
+      fighter: (67 + Math.min(this.wave, 8) * 1.4) * ENEMY_SPEED_SCALE,
+      interceptor: (94 + Math.min(this.wave, 8) * 1.7) * ENEMY_SPEED_SCALE,
+      bomber: (49 + Math.min(this.wave, 8)) * ENEMY_SPEED_SCALE,
     };
     enemy.active = true;
     enemy.health = healthByKind[enemy.kind];
@@ -2743,8 +2763,9 @@ class DogfightEngine {
   }
 
   private firePlayerLaser() {
+    const target = this.findTarget();
     this.muzzleSide *= -1;
-    this.tempV1
+    const muzzle = this.tempV4
       .set(
         this.muzzleSide * 2.75 * PLAYER_XWING_VISUAL_SCALE,
         this.muzzleSide * 0.58 * PLAYER_XWING_VISUAL_SCALE,
@@ -2752,16 +2773,59 @@ class DogfightEngine {
       )
       .applyQuaternion(this.player.quaternion)
       .add(this.player.position);
-    this.tempV2
-      .copy(LOCAL_FORWARD)
-      .applyQuaternion(this.player.quaternion)
-      .multiplyScalar(285 + this.speed)
-      .addScaledVector(
-        this.tempV3.copy(LOCAL_FORWARD).applyQuaternion(this.player.quaternion),
-        this.speed,
-      );
-    this.spawnProjectile(true, this.tempV1, this.tempV2, 28, 2.25);
+    const boltSpeed = this.playerBoltSpeed();
+    const velocity = this.tempV5
+      .subVectors(this.playerAimPoint(target, boltSpeed, this.tempV6), muzzle)
+      .setLength(boltSpeed);
+    this.spawnProjectile(true, muzzle, velocity, 28, 2.25);
     this.audio.laser(false);
+  }
+
+  private playerBoltSpeed() {
+    return 285 + this.speed * 2;
+  }
+
+  /**
+   * Where both cannons aim: the target's lead point when it is nearly under
+   * the reticle (light aim assist), otherwise a point straight ahead at the
+   * target's range so the wingtip bolts cross where the player is looking.
+   */
+  private playerAimPoint(
+    target: Enemy | undefined,
+    boltSpeed: number,
+    out: THREE.Vector3,
+  ) {
+    const forward = this.tempV1
+      .copy(LOCAL_FORWARD)
+      .applyQuaternion(this.player.quaternion);
+    let convergence = BOLT_CONVERGENCE_DISTANCE;
+    if (target) {
+      const toTarget = this.tempV2.subVectors(
+        target.group.position,
+        this.player.position,
+      );
+      const distance = toTarget.length();
+      if (toTarget.dot(forward) > distance * BOLT_CONVERGENCE_MIN_COS) {
+        this.enemyLeadPoint(target, this.player.position, boltSpeed, out);
+        const toLead = this.tempV2.subVectors(out, this.player.position);
+        if (toLead.dot(forward) > toLead.length() * AIM_ASSIST_COS) return out;
+        convergence = clamp(distance, 60, 600);
+      }
+    }
+    return out.copy(this.player.position).addScaledVector(forward, convergence);
+  }
+
+  private enemyLeadPoint(
+    enemy: Enemy,
+    shooter: THREE.Vector3,
+    boltSpeed: number,
+    out: THREE.Vector3,
+  ) {
+    const velocity = this.tempV3
+      .copy(LOCAL_FORWARD)
+      .applyQuaternion(enemy.group.quaternion)
+      .multiplyScalar(enemy.speed);
+    return leadTargetPoint(shooter, enemy.group.position, velocity, boltSpeed, out);
   }
 
   private updateEnemies(delta: number) {
@@ -2777,7 +2841,8 @@ class DogfightEngine {
 
       const desired = this.tempV2.copy(toPlayer);
       const weaveStrength =
-        enemy.kind === "interceptor" ? 0.52 : enemy.kind === "fighter" ? 0.25 : 0.12;
+        (enemy.kind === "interceptor" ? 0.52 : enemy.kind === "fighter" ? 0.25 : 0.12) *
+        ENEMY_AGILITY_SCALE;
       desired.x += Math.sin(this.elapsed * 1.7 + enemy.phase) * weaveStrength;
       desired.y += Math.cos(this.elapsed * 1.25 + enemy.phase) * weaveStrength * 0.6;
 
@@ -2803,7 +2868,8 @@ class DogfightEngine {
       desired.normalize();
       this.tempQ1.setFromUnitVectors(LOCAL_FORWARD, desired);
       const turnRate =
-        enemy.kind === "interceptor" ? 1.75 : enemy.kind === "fighter" ? 1.18 : 0.72;
+        (enemy.kind === "interceptor" ? 1.75 : enemy.kind === "fighter" ? 1.18 : 0.72) *
+        ENEMY_AGILITY_SCALE;
       enemy.group.quaternion.slerp(this.tempQ1, Math.min(1, turnRate * delta));
       this.tempV3
         .copy(LOCAL_FORWARD)
@@ -2884,15 +2950,19 @@ class DogfightEngine {
         projectile.active = false;
         continue;
       }
+      const previous = this.tempV1.copy(projectile.position);
       projectile.position.addScaledVector(projectile.velocity, delta);
 
       if (projectile.friendly) {
         for (const enemy of this.enemies) {
           if (!enemy.active) continue;
-          const hitRadius = enemy.radius + (projectile.damage > 25 ? 0.8 : 0);
           if (
-            projectile.position.distanceToSquared(enemy.group.position) <
-            hitRadius * hitRadius
+            segmentHitsSphere(
+              previous,
+              projectile.position,
+              enemy.group.position,
+              enemy.radius,
+            )
           ) {
             projectile.active = false;
             enemy.health -= projectile.damage;
@@ -2904,13 +2974,21 @@ class DogfightEngine {
         }
       } else if (
         this.barrelRolling() &&
-        projectile.position.distanceToSquared(this.player.position) <
-          BARREL_ROLL_DEFLECT_RADIUS * BARREL_ROLL_DEFLECT_RADIUS
+        segmentHitsSphere(
+          previous,
+          projectile.position,
+          this.player.position,
+          BARREL_ROLL_DEFLECT_RADIUS,
+        )
       ) {
         this.deflectProjectile(projectile);
       } else if (
-        projectile.position.distanceToSquared(this.player.position) <
-        3.4 * 3.4
+        segmentHitsSphere(
+          previous,
+          projectile.position,
+          this.player.position,
+          PLAYER_HIT_RADIUS,
+        )
       ) {
         projectile.active = false;
         this.spawnExplosion(projectile.position, projectile.damage > 20 ? 6 : 3);
@@ -3244,7 +3322,25 @@ class DogfightEngine {
     let targetVisible = false;
     let targetDistance = 0;
     let targetLabel = "";
+    let leadX = 50;
+    let leadY = 50;
+    let leadVisible = false;
     if (target) {
+      this.enemyLeadPoint(
+        target,
+        this.player.position,
+        this.playerBoltSpeed(),
+        this.tempV4,
+      ).project(this.camera);
+      leadX = (this.tempV4.x * 0.5 + 0.5) * 100;
+      leadY = (-this.tempV4.y * 0.5 + 0.5) * 100;
+      leadVisible =
+        this.tempV4.z > -1 &&
+        this.tempV4.z < 1 &&
+        leadX > 3 &&
+        leadX < 97 &&
+        leadY > 3 &&
+        leadY < 97;
       this.tempV1.copy(target.group.position).project(this.camera);
       targetX = (this.tempV1.x * 0.5 + 0.5) * 100;
       targetY = (-this.tempV1.y * 0.5 + 0.5) * 100;
@@ -3282,6 +3378,9 @@ class DogfightEngine {
       targetVisible,
       targetLabel,
       targetDistance,
+      leadX,
+      leadY,
+      leadVisible,
       radar,
       boundary: false,
       damage: this.damageFlash,
@@ -3914,6 +4013,17 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
           {Math.round(hud.targetDistance)}M
         </span>
       </div>
+
+      <div
+        className="lead-marker"
+        style={
+          {
+            "--lead-x": `${hud.leadX}%`,
+            "--lead-y": `${hud.leadY}%`,
+            "--lead-visible": hud.targetVisible && hud.leadVisible ? 1 : 0,
+          } as React.CSSProperties
+        }
+      />
 
       <div className="camera-mode">
         {hud.camera} CAM // {hud.input}

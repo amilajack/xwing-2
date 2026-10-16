@@ -341,6 +341,34 @@ button {
   font-size: 9px;
 }
 
+/* Where to aim so bolts meet the locked target. */
+.lead-marker {
+  position: absolute;
+  left: var(--lead-x);
+  top: var(--lead-y);
+  width: 14px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  border: 1px solid #ff8c7d;
+  border-radius: 50%;
+  opacity: var(--lead-visible);
+  transition: opacity 100ms linear;
+  pointer-events: none;
+  filter: drop-shadow(0 0 5px rgba(255, 83, 71, 0.55));
+}
+
+.lead-marker::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 2px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: #ff8c7d;
+}
+
 .camera-mode {
   position: absolute;
   right: 28px;
