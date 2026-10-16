@@ -43,6 +43,19 @@ page.on("response", (response) => {
   }
 });
 
+const snapshot = () =>
+  page.evaluate(() => window.__rogueVectorQa?.snapshot());
+const forwardDot = (a, b) =>
+  a.playerForward.reduce(
+    (sum, component, index) => sum + component * b.playerForward[index],
+    0,
+  );
+const waitForManeuver = (kind) =>
+  page.waitForFunction(
+    (expected) => window.__rogueVectorQa?.snapshot().maneuver === expected,
+    kind,
+  );
+
 const hash = (buffer) => createHash("sha256").update(buffer).digest("hex");
 
 async function readFramebufferStats() {
@@ -190,6 +203,8 @@ try {
   await page.getByText("Right click / Ctrl").waitFor();
   await page.getByText("Left click / Space").waitFor();
   await page.getByText("Shift (10s hold)").waitFor();
+  await page.getByText("Q / E or double-tap ← / →").waitFor();
+  await page.getByText("S + Shift").waitFor();
   await page.getByRole("button", { name: "Return" }).click();
 
   await launch.click();
@@ -323,6 +338,74 @@ try {
     () => window.__rogueVectorQa?.snapshot().boostActive === false,
   );
 
+  // Star Fox style maneuvers, flown from the keyboard with the stick
+  // centred so the headings can be compared afterwards.
+  await page.mouse.move(720, 450);
+  await page.waitForTimeout(300);
+  await page.screenshot({
+    path: resolve(outputDirectory, "04a-before-maneuvers.png"),
+    fullPage: true,
+  });
+  await page.keyboard.press("e");
+  await waitForManeuver("barrelRoll");
+  const duringRoll = await snapshot();
+  assert.equal(duringRoll.deflecting, true, "a barrel roll did not deflect");
+  await page.screenshot({
+    path: resolve(outputDirectory, "04b-barrel-roll.png"),
+    fullPage: true,
+  });
+  await waitForManeuver(null);
+
+  const beforeSomersault = await snapshot();
+  await page.keyboard.press("w");
+  await waitForManeuver("somersault");
+  await page.waitForTimeout(700);
+  await page.screenshot({
+    path: resolve(outputDirectory, "04c-somersault.png"),
+    fullPage: true,
+  });
+  await waitForManeuver(null);
+  const afterSomersault = await snapshot();
+  const somersaultDot = forwardDot(beforeSomersault, afterSomersault);
+  assert.ok(
+    somersaultDot > 0.99,
+    `a somersault did not return to its heading (dot ${somersaultDot})`,
+  );
+
+  const beforeBrake = await snapshot();
+  await page.keyboard.down("s");
+  await page.waitForFunction(
+    () => window.__rogueVectorQa?.snapshot().braking === true,
+  );
+  await page.waitForTimeout(500);
+  const duringBrake = await snapshot();
+  assert.ok(
+    duringBrake.speed < beforeBrake.speed * 0.75,
+    `holding S did not brake (${beforeBrake.speed} -> ${duringBrake.speed})`,
+  );
+  await page.screenshot({
+    path: resolve(outputDirectory, "04d-brake.png"),
+    fullPage: true,
+  });
+  await page.keyboard.down("Shift");
+  await waitForManeuver("uturn");
+  await page.keyboard.up("Shift");
+  await page.keyboard.up("s");
+  const beforeUturnEnd = duringBrake;
+  await waitForManeuver(null);
+  const afterUturn = await snapshot();
+  const uturnDot = forwardDot(beforeUturnEnd, afterUturn);
+  assert.ok(uturnDot < -0.98, `a U-turn did not reverse heading (dot ${uturnDot})`);
+  await page.screenshot({
+    path: resolve(outputDirectory, "04e-after-uturn.png"),
+    fullPage: true,
+  });
+
+  // The maneuvers spent reservoir; the burn cap is only measurable from full.
+  await page.waitForFunction(
+    () => (window.__rogueVectorQa?.snapshot().boostRemaining ?? 0) >= 10,
+  );
+
   // Pin the burner down for a full minute of fixed-step updates. No single
   // uninterrupted burn may exceed the ten-second reservoir.
   const longestBurnSeconds = await page.evaluate(() =>
@@ -435,6 +518,10 @@ try {
     beforeBoost,
     duringBoost,
     longestBurnSeconds,
+    duringRoll,
+    somersaultDot,
+    duringBrake,
+    uturnDot,
     hudBeforeCamera,
     hudAfterCamera,
     qualityTransitions,
