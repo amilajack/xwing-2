@@ -12,7 +12,14 @@ await mkdir(outputDirectory, { recursive: true });
 const browser = await chromium.launch({
   headless: !headed,
   channel: headed ? "chrome" : undefined,
-  args: ["--enable-webgl", "--ignore-gpu-blocklist"],
+  // Render on the GPU: headless Chromium otherwise falls back to SwiftShader.
+  // 2026-10-19, GTX 1050: SwiftShader 1.4 FPS, 241 s to launch → EGL 60 FPS, 6 s.
+  args: [
+    "--enable-webgl",
+    "--ignore-gpu-blocklist",
+    "--use-gl=angle",
+    "--use-angle=gl-egl",
+  ],
 });
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
