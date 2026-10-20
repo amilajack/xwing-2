@@ -287,6 +287,16 @@ const BOOST_RESPONSE = 4.5;
 const BOOST_FOV_KICK = 14;
 const BOOST_CHASE_PULLBACK = 16;
 const PLAYER_XWING_VISUAL_SCALE = 5;
+// The X-wing model's four cannon tips, measured from its gun meshes, in the
+// alternating-diagonal order the cannons fire.
+const PLAYER_CANNON_MUZZLES = [
+  [4.28, 1.01],
+  [-4.28, -0.8],
+  [-4.28, 1.01],
+  [4.28, -0.8],
+].map(([x, y]) =>
+  new THREE.Vector3(x, y, -1.68).multiplyScalar(PLAYER_XWING_VISUAL_SCALE),
+);
 // Player bolts converge on the locked target's range (or this default), so
 // both wingtip cannons hit what sits under the reticle.
 const BOLT_CONVERGENCE_DISTANCE = 250;
@@ -1341,7 +1351,7 @@ class DogfightEngine {
   private lastDamageTime = -20;
   private collisionCooldown = 0;
   private fireCooldown = 0;
-  private muzzleSide = 1;
+  private muzzleIndex = 0;
   private wave = 1;
   private score = 0;
   private waveDelay = 0;
@@ -2904,13 +2914,9 @@ class DogfightEngine {
 
   private firePlayerLaser() {
     const target = this.findTarget();
-    this.muzzleSide *= -1;
+    this.muzzleIndex = (this.muzzleIndex + 1) % PLAYER_CANNON_MUZZLES.length;
     const muzzle = this.tempV4
-      .set(
-        this.muzzleSide * 2.75 * PLAYER_XWING_VISUAL_SCALE,
-        this.muzzleSide * 0.58 * PLAYER_XWING_VISUAL_SCALE,
-        -1.4 * PLAYER_XWING_VISUAL_SCALE,
-      )
+      .copy(PLAYER_CANNON_MUZZLES[this.muzzleIndex])
       .applyQuaternion(this.player.quaternion)
       .add(this.player.position);
     const boltSpeed = this.playerBoltSpeed();
