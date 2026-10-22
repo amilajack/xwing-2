@@ -304,6 +304,29 @@ const PLAYER_CANNON_MUZZLES = [
   new THREE.Vector3(x, y, -1.68).multiplyScalar(PLAYER_XWING_VISUAL_SCALE),
 );
 
+/**
+ * The centers of the spaceship's four engine nozzle exits,
+ * measured from the rearmost faces of its engine meshes.
+ */
+const PLAYER_ENGINE_NOZZLES = [
+  [1.25, -0.54],
+  [-1.25, -0.54],
+  [1.25, 0.76],
+  [-1.25, 0.76],
+].map(([x, y]) =>
+  new THREE.Vector3(x, y, 4.88).multiplyScalar(PLAYER_XWING_VISUAL_SCALE),
+);
+
+/**
+ * The vacuum of space would leave no smoke or air-shaped flame,
+ * and the thin plume is nearly invisible end-on from the chase camera,
+ * so what reads is the nozzle itself: boost runs it hotter,
+ * brightening its glow from orange toward blue-white.
+ */
+const EXHAUST_CRUISE_COLOR = new THREE.Color(0xff8a5c);
+const EXHAUST_BOOST_COLOR = new THREE.Color(0xb8e4ff);
+const EXHAUST_GLOW_SIZE = 5;
+
 // Player bolts converge on the locked target's range (or this default), so
 // both wingtip cannons hit what sits under the reticle.
 const BOLT_CONVERGENCE_DISTANCE = 250;
@@ -1308,6 +1331,11 @@ class DogfightEngine {
   private mouseYPercent = 0;
   private mouseFire = false;
   private muzzleFlashes: Array<{ sprite: THREE.Sprite; life: number }> = [];
+  /**
+   * Rolls with the model, which banks inside the flight frame.
+   */
+  private exhaustMount = new THREE.Group();
+  private exhaustGlows: THREE.Sprite[] = [];
   private touchFire = false;
   private touchBoost = false;
   private touchSteeringActive = false;
@@ -1639,6 +1667,7 @@ class DogfightEngine {
 
     this.buildEnemyPool();
     this.buildMuzzleFlashes();
+    this.buildExhausts();
     this.buildProjectilePool();
     this.buildExplosionPool();
 
@@ -2515,6 +2544,7 @@ class DogfightEngine {
 
     if (this.status === "playing") {
       this.fixedUpdate(delta);
+      this.updateExhausts();
       this.updateCamera(delta);
       this.updateAdaptiveResolution(delta);
     } else {
@@ -3333,6 +3363,41 @@ class DogfightEngine {
       flash.sprite.scale.setScalar(
         (MUZZLE_FLASH_SIZE * flash.life) / MUZZLE_FLASH_SECONDS,
       );
+    }
+  }
+
+  private buildExhausts() {
+    const material = new THREE.SpriteMaterial({
+      map: this.assets.glowTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    });
+
+    for (const nozzle of PLAYER_ENGINE_NOZZLES) {
+      const glow = new THREE.Sprite(material);
+
+      glow.position.copy(nozzle);
+
+      this.exhaustMount.add(glow);
+      this.exhaustGlows.push(glow);
+    }
+
+    this.player.add(this.exhaustMount);
+    this.updateExhausts();
+  }
+
+  private updateExhausts() {
+    const boost = this.boostBlend;
+    const material = this.exhaustGlows[0].material;
+
+    this.exhaustMount.rotation.z = this.playerModel.rotation.z;
+    material.color.lerpColors(EXHAUST_CRUISE_COLOR, EXHAUST_BOOST_COLOR, boost);
+    material.opacity = 0.3 + boost * 0.6;
+
+    for (const glow of this.exhaustGlows) {
+      glow.scale.setScalar(EXHAUST_GLOW_SIZE * (1 + boost * 0.5));
     }
   }
 
