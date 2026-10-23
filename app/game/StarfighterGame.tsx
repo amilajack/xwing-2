@@ -997,6 +997,7 @@ function createCockpitRig(assets: SharedAssets) {
 
 type Enemy = {
   id: number;
+  label?: string;
   active: boolean;
   kind: EnemyKind;
   group: THREE.Group;
@@ -2391,7 +2392,7 @@ class DogfightEngine extends FlightDynamics {
     this.shields = local.shields;
     this.hull = local.hull;
     this.wave = state.wave;
-    this.score = state.score;
+    this.score = state.mode === "versus" ? local.points : state.score;
     this.player.visible = local.hull > 0 && this.cameraMode === "CHASE";
     this.cockpit.visible = local.hull > 0 && this.cameraMode === "COCKPIT";
     const alpha = Math.min(1, (performance.now() - client.receivedAt) / 50);
@@ -2415,7 +2416,7 @@ class DogfightEngine extends FlightDynamics {
         label.width = 512;
         label.height = 64;
         const ctx = label.getContext("2d")!;
-        ctx.fillStyle = "#72ffe1";
+        ctx.fillStyle = state.mode === "versus" ? "#ff796f" : "#72ffe1";
         ctx.font = "28px monospace";
         ctx.textAlign = "center";
         ctx.fillText(`◇ ${p.callsign}`, 256, 42);
@@ -2432,6 +2433,29 @@ class DogfightEngine extends FlightDynamics {
         this.scene.add(group);
         this.teammates.set(p.id, group);
       }
+      const marker = group.children.find(
+        (child) => child instanceof THREE.Sprite,
+      ) as THREE.Sprite;
+      const labelText =
+        state.mode === "versus"
+          ? `◆ ${p.callsign} // S${Math.ceil(p.shields)} H${Math.ceil(p.hull)}${p.protectedUntil > state.tick ? " [SHIELD]" : ""}`
+          : `◇ ${p.callsign}`;
+      if (marker.userData.text !== labelText) {
+        const canvas = marker.material.map!.image as HTMLCanvasElement;
+        const ctx = canvas.getContext("2d")!;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle =
+          p.protectedUntil > state.tick
+            ? "#72ffe1"
+            : state.mode === "versus"
+              ? "#ff796f"
+              : "#72ffe1";
+        ctx.font = "22px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(labelText, 256, 42);
+        marker.material.map!.needsUpdate = true;
+        marker.userData.text = labelText;
+      }
       const old = client.previous?.pilots.find((x) => x.id === p.id);
       group.visible = p.hull > 0;
       group.position.copy(near(p.flight.p, old?.flight.p));
@@ -2439,8 +2463,14 @@ class DogfightEngine extends FlightDynamics {
     }
     for (const [id, group] of this.teammates) {
       if (!seen.has(id)) {
-        group.traverse(child => { if (child instanceof THREE.Sprite) { child.material.map?.dispose(); child.material.dispose(); } });
-        this.scene.remove(group); this.teammates.delete(id);
+        group.traverse((child) => {
+          if (child instanceof THREE.Sprite) {
+            child.material.map?.dispose();
+            child.material.dispose();
+          }
+        });
+        this.scene.remove(group);
+        this.teammates.delete(id);
       }
     }
     this.enemies.forEach((e) => {
@@ -2467,7 +2497,8 @@ class DogfightEngine extends FlightDynamics {
       const p = this.projectiles[i];
       if (!p) return;
       p.active = true;
-      p.friendly = b.owner !== null;
+      p.friendly =
+        state.mode === "versus" ? b.owner === local.id : b.owner !== null;
       p.position.copy(
         near(b.p, client.previous?.bolts.find((x) => x.id === b.id)?.p),
       );
@@ -3450,13 +3481,41 @@ class DogfightEngine extends FlightDynamics {
     return count;
   }
 
+  private hostilePilots(): Enemy[] {
+    const state = this.coop?.view.state;
+    if (state?.mode !== "versus") return [];
+    return state.pilots
+      .filter((p) => p.id !== this.coop!.view.pilot && p.hull > 0)
+      .flatMap((p, i) => {
+        const group = this.teammates.get(p.id);
+        return group
+          ? [
+              {
+                id: -i - 1,
+                label: `${p.callsign} // S${Math.ceil(p.shields)} H${Math.ceil(p.hull)}`,
+                active: true,
+                kind: "fighter" as const,
+                group,
+                health: p.hull + p.shields,
+                maxHealth: 200,
+                speed: p.flight.n[2],
+                cooldown: 0,
+                burst: 0,
+                phase: 0,
+                radius: 3.4,
+              },
+            ]
+          : [];
+      });
+  }
+
   private findTarget() {
     let target: Enemy | undefined;
     let bestScore = Number.POSITIVE_INFINITY;
     const playerForward = this.tempV1
       .copy(LOCAL_FORWARD)
       .applyQuaternion(this.player.quaternion);
-    for (const enemy of this.enemies) {
+    for (const enemy of [...this.enemies, ...this.hostilePilots()]) {
       if (!enemy.active || !enemy.group.visible) continue;
       const direction = this.tempV2.subVectors(
         enemy.group.position,
@@ -3493,7 +3552,7 @@ class DogfightEngine extends FlightDynamics {
     if (!this.renderer) return;
     const radar: RadarContact[] = [];
     const inversePlayer = this.tempQ1.copy(this.player.quaternion).invert();
-    for (const enemy of this.enemies) {
+    for (const enemy of [...this.enemies, ...this.hostilePilots()]) {
       if (!enemy.active) continue;
       this.tempV1
         .subVectors(enemy.group.position, this.player.position)
@@ -3543,11 +3602,12 @@ class DogfightEngine extends FlightDynamics {
         targetY < 97;
       targetDistance = target.group.position.distanceTo(this.player.position);
       targetLabel =
-        target.kind === "fighter"
+        target.label ??
+        (target.kind === "fighter"
           ? "TIE / LN"
           : target.kind === "interceptor"
             ? "TIE / IN"
-            : "STEALTH BOMBER";
+            : "STEALTH BOMBER");
     }
 
     this.callbacks.onHud({
@@ -3561,7 +3621,7 @@ class DogfightEngine extends FlightDynamics {
       maneuver: this.maneuverLabel(),
       wave: this.wave,
       score: this.score,
-      enemies: this.activeEnemyCount(),
+      enemies: this.activeEnemyCount() + this.hostilePilots().length,
       camera: this.cameraMode,
       targetX,
       targetY,
@@ -4407,6 +4467,7 @@ export function StarfighterGame() {
   const [showMobileGuide, setShowMobileGuide] = useState(false);
   const [highScore, setHighScore] = useState(loadHighScore);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [matchMode, setMatchMode] = useState<"coop" | "versus">("coop");
   const [callsign, setCallsign] = useState("Rogue One");
   const [squad, setSquad] = useState("Rogue Squadron");
   const [coopView, setCoopView] = useState<CoopView | null>(null);
@@ -4437,7 +4498,7 @@ export function StarfighterGame() {
       setCoopView,
     );
     try {
-      await client.join(action, callsign, squad, invite);
+      await client.join(action, callsign, squad, invite, matchMode);
       engineRef.current.startCoop(client);
     } catch (error) {
       client.leave();
@@ -4612,20 +4673,73 @@ export function StarfighterGame() {
         <aside className="squad-panel" aria-label="Squad status">
           <strong>{coopView.squad}</strong>
           <span role="status">{coopView.message}</span>
-          <span>
-            Wave {coopView.state?.wave ?? 1} {"//"} Team score{" "}
-            {coopView.state?.score ?? 0}
-          </span>
-          {coopView.state?.pilots.map((p) => (
-            <span key={p.id}>
-              ◇ {p.callsign}
-              {p.id === coopView.pilot ? " (you)" : ""} {"//"} {p.kills} kills{" "}
-              {"//"} {p.connected ? "online" : "reserved"}
-              {p.hull <= 0
-                ? ` // Respawn ${Math.max(0, Math.ceil((p.respawnAt - coopView.state!.tick) / 60))}s`
-                : ""}
-            </span>
-          ))}
+          {coopView.state?.mode === "versus" ? (
+            <>
+              <strong>Versus // First to 10 player kills</strong>
+              <span role="status">
+                {coopView.state.phase === "waiting"
+                  ? "Waiting for another pilot…"
+                  : coopView.state.phase === "results"
+                    ? `${coopView.state.standings.find((p) => p.id === coopView.state!.winner)?.callsign ?? "Pilot"} wins! Rematch in ${Math.max(0, Math.ceil((coopView.state.roundEndsAt - coopView.state.tick) / 60))}s`
+                    : `Round ${coopView.state.round} // Wave ${coopView.state.wave}`}
+              </span>
+              {[...coopView.state.standings]
+                .sort(
+                  (a, b) =>
+                    b.humanKills - a.humanKills ||
+                    a.deaths - b.deaths ||
+                    a.callsign.localeCompare(b.callsign),
+                )
+                .map((p) => {
+                  const live = coopView.state!.pilots.find(
+                    (x) => x.id === p.id,
+                  );
+                  return (
+                    <span key={p.id}>
+                      ◆ {p.callsign}
+                      {p.id === coopView.pilot ? " (you)" : ""}
+                      {" // "}
+                      {p.humanKills}/10 kills {"//"} {p.deaths} deaths{" "}
+                      {"// AI "}
+                      {p.kills} ({p.points} pts)
+                      {live
+                        ? live.connected
+                          ? " // online"
+                          : " // reserved"
+                        : " // left"}
+                      {live &&
+                      coopView.state!.phase === "active" &&
+                      live.hull <= 0
+                        ? ` // Respawn ${Math.max(0, Math.ceil((live.respawnAt - coopView.state!.tick) / 60))}s`
+                        : ""}
+                      {live && live.protectedUntil > coopView.state!.tick
+                        ? " // Spawn shield"
+                        : ""}
+                    </span>
+                  );
+                })}
+            </>
+          ) : (
+            <>
+              <span>
+                Wave {coopView.state?.wave ?? 1}
+                {" // Team score "}
+                {coopView.state?.score ?? 0}
+              </span>
+              {coopView.state?.pilots.map((p) => (
+                <span key={p.id}>
+                  ◇ {p.callsign}
+                  {p.id === coopView.pilot ? " (you)" : ""}
+                  {" // "}
+                  {p.kills} kills
+                  {"//"} {p.connected ? "online" : "reserved"}
+                  {p.hull <= 0
+                    ? ` // Respawn ${Math.max(0, Math.ceil((p.respawnAt - coopView.state!.tick) / 60))}s`
+                    : ""}
+                </span>
+              ))}
+            </>
+          )}
           <div>
             {coopView.invite && (
               <button
@@ -4694,7 +4808,30 @@ export function StarfighterGame() {
                 </button>
               </div>
               <fieldset className="coop-lobby" disabled={joining}>
-                <legend>Co-op // Up to four pilots</legend>
+                <legend>Multiplayer // Up to four pilots</legend>
+                {!invite && (
+                  <label>
+                    Mode
+                    <select
+                      aria-label="Match mode"
+                      value={matchMode}
+                      onChange={(e) =>
+                        setMatchMode(e.target.value as "coop" | "versus")
+                      }
+                    >
+                      <option value="coop">Co-op</option>
+                      <option value="versus">
+                        Versus — first to 10 player kills
+                      </option>
+                    </select>
+                  </label>
+                )}
+                {matchMode === "versus" && !invite && (
+                  <p>
+                    Free-for-all with AI waves. Only player kills count toward
+                    victory.
+                  </p>
+                )}
                 <label>
                   Callsign
                   <input

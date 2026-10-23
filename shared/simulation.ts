@@ -10,7 +10,6 @@ import {
 } from "./combat";
 import { FlightDynamics } from "./flight";
 import { neutralControls, TICK_SECONDS, type Controls } from "./protocol";
-import { segmentHitsSphere } from "../app/game/combatMath";
 import { BARREL_ROLL_DEFLECT_RADIUS } from "../app/game/maneuvers";
 export const ARENA_PERIOD = 1400;
 export const wrap = (x: number) =>
@@ -124,6 +123,16 @@ export function advancePilot(
   f.advanceFlight(dt, input);
   wrapPosition(f.player.position);
 }
+export type MatchMode = "coop" | "versus";
+export type ParticipantStats = {
+  id: string;
+  callsign: string;
+  kills: number;
+  humanKills: number;
+  deaths: number;
+  points: number;
+};
+export type RoundPhase = "waiting" | "active" | "results";
 export type Pilot = {
   id: string;
   callsign: string;
@@ -132,6 +141,10 @@ export type Pilot = {
   ack: number;
   lastInputTick: number;
   kills: number;
+  humanKills: number;
+  deaths: number;
+  points: number;
+  protectedUntil: number;
   shields: number;
   hull: number;
   respawnAt: number;
@@ -162,13 +175,27 @@ export type Bolt = {
   expires: number;
 };
 export type CombatEvent = {
-  type: "kill" | "destroyed" | "respawn" | "joined" | "left";
+  type:
+    | "kill"
+    | "destroyed"
+    | "respawn"
+    | "joined"
+    | "left"
+    | "round_started"
+    | "round_ended"
+    | "round_reset";
   pilot: string;
   enemy?: number;
   points?: number;
   tick: number;
 };
 export type WorldSnapshot = {
+  mode: MatchMode;
+  round: number;
+  phase: RoundPhase;
+  winner: string | null;
+  roundEndsAt: number;
+  standings: ParticipantStats[];
   tick: number;
   seed: number;
   wave: number;
@@ -179,6 +206,10 @@ export type WorldSnapshot = {
     flight: FlightWire;
     ack: number;
     kills: number;
+    humanKills: number;
+    deaths: number;
+    points: number;
+    protectedUntil: number;
     shields: number;
     hull: number;
     respawnAt: number;
@@ -201,15 +232,16 @@ export type WorldSnapshot = {
   }[];
 };
 export class Simulation {
+  round = 1;
+  phase: RoundPhase;
+  winner: string | null = null;
+  roundEndsAt = 0;
   tick = 0;
   wave = 1;
   score = 0;
   waveAt = 0;
   readonly pilots = new Map<string, Pilot>();
-  readonly participants = new Map<
-    string,
-    { id: string; callsign: string; kills: number }
-  >();
+  readonly participants = new Map<string, ParticipantStats>();
   enemies: Enemy[] = [];
   bolts: Bolt[] = [];
   events: CombatEvent[] = [];
@@ -217,7 +249,11 @@ export class Simulation {
   private asteroidGrid = new Map<string, Asteroid[]>();
   private random: () => number;
   private nextId = 1;
-  constructor(readonly seed: number) {
+  constructor(
+    readonly seed: number,
+    readonly mode: MatchMode = "coop",
+  ) {
+    this.phase = mode === "versus" ? "waiting" : "active";
     this.random = seededRandom(seed);
     this.asteroids = collisionMap(seed);
     for (const a of this.asteroids) {
@@ -265,6 +301,10 @@ export class Simulation {
       ack: 0,
       lastInputTick: this.tick,
       kills: 0,
+      humanKills: 0,
+      deaths: 0,
+      points: 0,
+      protectedUntil: this.mode === "versus" ? this.tick + 120 : 0,
       shields: 100,
       hull: 100,
       respawnAt: 0,
@@ -274,10 +314,20 @@ export class Simulation {
       connected: true,
     };
     this.pilots.set(id, p);
-    this.participants.set(id, { id, callsign, kills: 0 });
+    this.participants.set(id, {
+      id,
+      callsign,
+      kills: 0,
+      humanKills: 0,
+      deaths: 0,
+      points: 0,
+    });
+    if (this.mode === "versus") this.placePilot(p);
     this.events.push({ type: "joined", pilot: id, tick: this.tick });
-    if (this.participants.size === 1) this.spawnWave();
-    else this.spawnSquadron(id);
+    if (this.phase === "active") {
+      if (this.participants.size === 1) this.spawnWave();
+      else this.spawnSquadron(id);
+    }
     return p;
   }
   leave(id: string) {
@@ -357,29 +407,146 @@ export class Simulation {
     }
     return null;
   }
-  damagePilot(p: Pilot, amount: number) {
-    if (p.hull <= 0) return;
+  private placePilot(p: Pilot) {
+    let best = p.flight.player.position.clone(),
+      clearance = -1;
+    const consider = (candidate: Vector3) => {
+      if (this.asteroidAt(candidate, 16)) return false;
+      let distance = Infinity;
+      for (const other of this.pilots.values())
+        if (other !== p && other.hull > 0)
+          distance = Math.min(
+            distance,
+            offset(candidate, other.flight.player.position).length(),
+          );
+      if (distance > clearance) {
+        best = candidate;
+        clearance = distance;
+      }
+      return distance >= 180;
+    };
+    for (let attempt = 0; attempt < 96; attempt++) {
+      if (
+        consider(
+          new Vector3(
+            this.random() * 1400 - 700,
+            this.random() * 1000 - 500,
+            this.random() * 1400 - 700,
+          ),
+        )
+      ) {
+        p.flight.player.position.copy(best);
+        return;
+      }
+    }
+    // Fixed, widely spaced fallback candidates keep placement bounded even if random samples are obstructed.
+    for (let x = -600; x <= 600; x += 200)
+      for (let y = -600; y <= 600; y += 200)
+        for (let z = -600; z <= 600; z += 200)
+          if (consider(new Vector3(x, y, z))) {
+            p.flight.player.position.copy(best);
+            return;
+          }
+    p.flight.player.position.copy(best);
+  }
+  private resetPilots() {
+    for (const p of this.pilots.values()) {
+      p.flight = new FlightDynamics();
+      this.placePilot(p);
+      p.hull = p.shields = 100;
+      p.respawnAt = 0;
+      p.protectedUntil = this.tick + 120;
+      p.fireAt = this.tick;
+      p.lastDamage = this.tick;
+      p.collisionUntil = this.tick;
+      p.input = neutralControls(p.input.seq);
+    }
+  }
+  private nextRound() {
+    this.round++;
+    this.phase = "waiting";
+    this.winner = null;
+    this.roundEndsAt = 0;
+    this.wave = 1;
+    this.waveAt = 0;
+    this.score = 0;
+    this.bolts = [];
+    this.enemies = [];
+    this.participants.clear();
+    for (const p of this.pilots.values()) {
+      p.kills = p.humanKills = p.deaths = p.points = 0;
+      this.participants.set(p.id, {
+        id: p.id,
+        callsign: p.callsign,
+        kills: 0,
+        humanKills: 0,
+        deaths: 0,
+        points: 0,
+      });
+    }
+    this.resetPilots();
+    this.events.push({ type: "round_reset", pilot: "", tick: this.tick });
+  }
+  damagePilot(p: Pilot, amount: number, owner: string | null = null) {
+    if (p.hull <= 0 || amount <= 0 || !Number.isFinite(amount)) return;
+    if (
+      this.mode === "versus" &&
+      (this.phase !== "active" || this.tick < p.protectedUntil)
+    )
+      return;
     p.lastDamage = this.tick;
     const damage = damageLayers(p.shields, p.hull, amount);
     p.shields = damage.shields;
     p.hull = damage.hull;
     if (p.hull === 0) {
       p.respawnAt = this.tick + 300;
+      p.deaths++;
+      const victim = this.participants.get(p.id);
+      if (victim) victim.deaths++;
       this.events.push({ type: "destroyed", pilot: p.id, tick: this.tick });
+      if (this.mode === "versus" && owner && owner !== p.id) {
+        const attacker = this.participants.get(owner);
+        if (attacker) {
+          attacker.humanKills++;
+          const live = this.pilots.get(owner);
+          if (live) live.humanKills = attacker.humanKills;
+          if (attacker.humanKills >= 10) {
+            this.winner = owner;
+            this.phase = "results";
+            this.roundEndsAt = this.tick + 600;
+            this.events.push({
+              type: "round_ended",
+              pilot: owner,
+              tick: this.tick,
+            });
+          }
+        }
+      }
     }
   }
   damageEnemy(id: number, amount: number, owner: string) {
     const e = this.enemies.find((e) => e.id === id);
-    if (!e || amount <= 0) return;
+    if (
+      !e ||
+      amount <= 0 ||
+      (this.mode === "versus" && this.phase !== "active")
+    )
+      return;
     e.health -= amount;
     if (e.health > 0) return;
     const points = enemyPoints(e.kind, this.wave);
     this.enemies = this.enemies.filter((x) => x !== e);
     this.score += points;
     const participant = this.participants.get(owner);
-    if (participant) participant.kills++;
+    if (participant) {
+      participant.kills++;
+      participant.points += points;
+    }
     const p = this.pilots.get(owner);
-    if (p) p.kills++;
+    if (p) {
+      p.kills++;
+      p.points += points;
+    }
     this.events.push({
       type: "kill",
       pilot: owner,
@@ -402,6 +569,21 @@ export class Simulation {
   step() {
     if (!this.pilots.size) return;
     this.tick++;
+    if (this.mode === "versus") {
+      if (this.phase === "results") {
+        if (this.tick >= this.roundEndsAt) this.nextRound();
+        return;
+      }
+      if (this.phase === "waiting") {
+        for (const p of this.pilots.values()) p.ack = p.input.seq;
+        if ([...this.pilots.values()].filter((p) => p.connected).length < 2)
+          return;
+        this.phase = "active";
+        this.resetPilots();
+        this.spawnWave();
+        this.events.push({ type: "round_started", pilot: "", tick: this.tick });
+      }
+    }
     const dt = TICK_SECONDS;
     for (const p of this.pilots.values()) {
       if (p.hull <= 0) {
@@ -409,6 +591,10 @@ export class Simulation {
           p.flight = new FlightDynamics();
           p.flight.player.position.x =
             [...this.pilots.keys()].indexOf(p.id) * 18;
+          if (this.mode === "versus") {
+            this.placePilot(p);
+            p.protectedUntil = this.tick + 120;
+          }
           p.shields = p.hull = 100;
           p.respawnAt = 0;
           this.events.push({ type: "respawn", pilot: p.id, tick: this.tick });
@@ -418,6 +604,7 @@ export class Simulation {
         p.connected && this.tick - p.lastInputTick <= 15
           ? p.input
           : neutralControls(p.input.seq);
+      if (input.fire) p.protectedUntil = 0;
       advancePilot(p.flight, input);
       p.input.maneuver = null;
       p.ack = input.seq;
@@ -448,7 +635,19 @@ export class Simulation {
         );
         const speed = 285 + p.flight.speed * 2;
         let direction = forward;
-        const target = this.enemies
+        const candidates: { p: Vector3; q: Quaternion; speed: number }[] = [
+          ...this.enemies,
+          ...(this.mode === "versus"
+            ? [...this.pilots.values()]
+                .filter((other) => other !== p && other.hull > 0)
+                .map((other) => ({
+                  p: other.flight.player.position,
+                  q: other.flight.player.quaternion,
+                  speed: other.flight.speed,
+                }))
+            : []),
+        ];
+        const target = candidates
           .map((e) => ({ e, d: offset(p.flight.player.position, e.p) }))
           .filter(
             ({ d }) =>
@@ -522,39 +721,70 @@ export class Simulation {
       if (b.expires <= this.tick) continue;
       const start = b.p.clone();
       const end = b.p.clone().addScaledVector(b.v, dt);
-      const hits = (p: Vector3, r: number) =>
-        segmentHitsSphere(start, end, start.clone().add(offset(start, p)), r);
-      if (
-        this.nearbyAsteroids(start).some((a) =>
-          hits(new Vector3(...a.position), a.radius),
-        )
-      )
-        continue;
-      let consumed = false;
-      if (b.owner !== null) {
-        for (const e of this.enemies)
-          if (hits(e.p, e.kind === "bomber" ? 7 : 4)) {
-            this.damageEnemy(e.id, b.damage, b.owner);
-            consumed = true;
-            break;
-          }
-      } else {
-        for (const p of alive) {
-          if (
-            p.flight.barrelRolling() &&
-            hits(p.flight.player.position, BARREL_ROLL_DEFLECT_RADIUS)
-          ) {
-            b.owner = p.id;
-            b.v.negate();
-            b.expires = this.tick + 144;
-            break;
-          }
-          if (hits(p.flight.player.position, 3.4)) {
-            this.damagePilot(p, b.damage);
-            consumed = true;
-            break;
+      const intersection = (p: Vector3, radius: number) => {
+        const direction = end.clone().sub(start),
+          center = offset(start, p);
+        const length = direction.length();
+        if (!length) return center.lengthSq() <= radius * radius ? 0 : Infinity;
+        direction.divideScalar(length);
+        const projection = center.dot(direction);
+        const discriminant =
+          radius * radius - (center.lengthSq() - projection * projection);
+        if (discriminant < 0) return Infinity;
+        const exit = projection + Math.sqrt(discriminant);
+        if (exit < 0) return Infinity;
+        const enter = Math.max(0, projection - Math.sqrt(discriminant));
+        return enter <= length ? enter : Infinity;
+      };
+      let nearest = Infinity;
+      let target:
+        | { kind: "asteroid" }
+        | { kind: "enemy"; enemy: Enemy }
+        | { kind: "pilot"; pilot: Pilot; deflect: boolean }
+        | null = null;
+      for (const a of this.nearbyAsteroids(start)) {
+        const distance = intersection(new Vector3(...a.position), a.radius);
+        if (distance < nearest) {
+          nearest = distance;
+          target = { kind: "asteroid" };
+        }
+      }
+      if (b.owner !== null)
+        for (const e of this.enemies) {
+          const distance = intersection(e.p, e.kind === "bomber" ? 7 : 4);
+          if (distance < nearest) {
+            nearest = distance;
+            target = { kind: "enemy", enemy: e };
           }
         }
+      if (b.owner === null || this.mode === "versus")
+        for (const p of alive) {
+          if (p.hull <= 0 || p.id === b.owner) continue;
+          const deflect = p.flight.barrelRolling();
+          const distance = intersection(
+            p.flight.player.position,
+            deflect ? BARREL_ROLL_DEFLECT_RADIUS : 3.4,
+          );
+          if (distance < nearest) {
+            nearest = distance;
+            target = { kind: "pilot", pilot: p, deflect };
+          }
+        }
+      const consumed = target !== null;
+      if (target?.kind === "enemy")
+        this.damageEnemy(target.enemy.id, b.damage, b.owner!);
+      if (target?.kind === "pilot") {
+        if (target.deflect) {
+          b.owner = target.pilot.id;
+          b.p.copy(start).addScaledVector(b.v.clone().normalize(), nearest);
+          b.v.negate();
+          b.expires = this.tick + 144;
+          keep.push(b);
+        } else this.damagePilot(target.pilot, b.damage, b.owner);
+      }
+      if (this.phase === "results") {
+        this.bolts = [];
+        return;
       }
       if (!consumed) {
         b.p.copy(wrapPosition(end));
@@ -573,6 +803,12 @@ export class Simulation {
   }
   snapshot(): WorldSnapshot {
     return {
+      mode: this.mode,
+      round: this.round,
+      phase: this.phase,
+      winner: this.winner,
+      roundEndsAt: this.roundEndsAt,
+      standings: [...this.participants.values()].map((p) => ({ ...p })),
       tick: this.tick,
       seed: this.seed,
       wave: this.wave,
@@ -583,6 +819,10 @@ export class Simulation {
         flight: flightWire(p.flight),
         ack: p.ack,
         kills: p.kills,
+        humanKills: p.humanKills,
+        deaths: p.deaths,
+        points: p.points,
+        protectedUntil: p.protectedUntil,
         shields: p.shields,
         hull: p.hull,
         respawnAt: p.respawnAt,

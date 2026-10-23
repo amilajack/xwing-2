@@ -21,13 +21,15 @@
     "prepare": "node scripts/install-hooks.mjs",
     "server:dev": "tsx server/index.ts",
     "server:build": "esbuild server/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server/index.mjs",
-    "test:coop": "tsx --test tests/coop.test.ts",
+    "test:coop": "tsx --test tests/coop.test.ts tests/versus.test.ts",
     "verify:coop": "node scripts/verify-coop-playwright.mjs",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "test:load": "node scripts/load-coop.mjs",
     "verify:coop:live": "node scripts/verify-coop-live.mjs",
     "verify:coop:lobby": "node scripts/verify-coop-lobby.mjs",
+    "verify:versus": "node scripts/verify-versus-playwright.mjs",
+    "verify:versus:persistence": "tsx scripts/verify-versus-persistence.mjs",
     "verify:coop:protocol": "node scripts/verify-coop-protocol.mjs"
   },
   "dependencies": {

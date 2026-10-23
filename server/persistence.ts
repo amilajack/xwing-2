@@ -34,6 +34,8 @@ export class Persistence {
       if (!this.client) throw new Error("Database unavailable");
       const r = job.result;
       const data = {
+        mode: r.mode,
+        winner: r.winner,
         seed: BigInt(r.seed),
         squad: r.squad,
         private: r.private,
@@ -52,9 +54,15 @@ export class Persistence {
           });
           for (const p of r.participants)
             await tx.participant.upsert({
-              where: { id: p.id },
+              where: { matchId_id: { matchId: id, id: p.id } },
               create: { ...p, matchId: id },
-              update: { callsign: p.callsign, kills: p.kills },
+              update: {
+                callsign: p.callsign,
+                kills: p.kills,
+                humanKills: p.humanKills,
+                deaths: p.deaths,
+                points: p.points,
+              },
             });
         },
         { timeout: 5000, maxWait: 1000 },

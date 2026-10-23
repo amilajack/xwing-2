@@ -1,5 +1,5 @@
 import type { ManeuverKind } from "../app/game/maneuvers";
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const TICK_SECONDS = 1 / 60;
 export const INPUT_SECONDS = 1 / 30;
 export const MAX_DATAGRAM = 1100;

@@ -282,6 +282,30 @@ const apiHandler: import("node:http").RequestListener = async (req, res) => {
         e.speed = 0;
         e.fireAt = Infinity;
       }
+    } else if (action === "versus-combat" || action === "versus-final") {
+      if (sim.mode !== "versus" || sim.phase !== "active")
+        return reply(409, {});
+      sim.bolts = [];
+      sim.enemies.forEach((e) => {
+        e.p.set(500, 500, 500);
+        e.speed = 0;
+        e.fireAt = Infinity;
+      });
+      let i = 0;
+      for (const p of sim.pilots.values()) {
+        p.flight.player.position.set(0, 0, -i++ * 120);
+        p.flight.player.quaternion.identity();
+        p.flight.mouseXPercent = p.flight.mouseYPercent = 0;
+        p.flight.angularVelocity.set(0, 0, 0);
+        p.shields = 0;
+        p.hull = action === "versus-final" ? 28 : 84;
+        p.protectedUntil = 0;
+        p.fireAt = sim.tick;
+        if (i === 1 && action === "versus-final") {
+          p.humanKills = 9;
+          sim.participants.get(p.id)!.humanKills = 9;
+        }
+      }
     } else if (action === "destroy") {
       const p = [...sim.pilots.values()][0];
       if (p) sim.damagePilot(p, 200);
@@ -349,7 +373,7 @@ const timer = setInterval(() => {
   let steps = 0;
   while (now >= nextTick && steps++ < 5) {
     const start = performance.now();
-    rooms.room?.sim.step();
+    rooms.step();
     tickTimes.push(performance.now() - start);
     tickCount++;
     nextTick += 1000 / 60;
@@ -384,7 +408,11 @@ const timer = setInterval(() => {
     if (rooms.room) {
       const events = rooms.room.sim.events.splice(0);
       if (events.length)
-        for (const peer of peers) peer.send({ type: "events", events });
+        for (const peer of peers) {
+          peer.send({ type: "events", events });
+          if (events.some((e) => e.type.startsWith("round_")))
+            peer.send({ type: "round", state: rooms.room.sim.snapshot() });
+        }
     }
   }
   if (steps >= 5) nextTick = now + 1000 / 60;
