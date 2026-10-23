@@ -1,0 +1,42 @@
+name: Deploy co-op server
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: xwing-coop-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/setup@v3
+        with:
+          runtime: node
+          cache: true
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate && pnpm typecheck && pnpm lint && pnpm test:coop
+      - run: scripts/build-server-artifact.sh
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::226884944687:role/xwing-coop-github
+          aws-region: us-west-1
+      - name: Upload immutable release
+        run: |
+          aws s3 cp outputs/deploy/release.tar.gz "s3://xwing-coop-226884944687-us-west-1/releases/$GITHUB_SHA.tar.gz" --sse AES256
+          aws s3 cp outputs/deploy/release.tar.gz s3://xwing-coop-226884944687-us-west-1/releases/current.tar.gz --sse AES256
+      - name: Drain, migrate and restart through SSM
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('/tmp/release-command.json').write_text(json.dumps({'commands': ['/usr/local/bin/xwing-release releases/' + os.environ['GITHUB_SHA'] + '.tar.gz']}))
+          PY
+          INSTANCE_ID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=xwing-coop Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript --parameters file:///tmp/release-command.json --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}'
+      - run: curl --fail --retry 8 --retry-delay 5 https://xwing-mp.amilajack.com/health

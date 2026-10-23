@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,20 +11,10 @@ import * as THREE from "three";
  */
 const require = createRequire(import.meta.url);
 const gameDirectory = resolve(fileURLToPath(import.meta.url), "../../../app/game");
-const { transformSync } = require("next/dist/build/swc/index.js");
+const { buildSync } = require("esbuild");
 
 export async function loadEngine(cacheName) {
   const sourcePath = resolve(gameDirectory, "StarfighterGame.tsx");
-  const { code } = await transformSync(readFileSync(sourcePath, "utf8"), {
-    filename: sourcePath,
-    jsc: {
-      parser: { syntax: "typescript", tsx: true },
-      transform: { react: { runtime: "automatic" } },
-      target: "es2022",
-    },
-    module: { type: "es6" },
-  });
-
   /**
    * Written under node_modules so
    * the engine's own imports resolve.
@@ -37,12 +27,22 @@ export async function loadEngine(cacheName) {
   const outputPath = resolve(outputDirectory, "StarfighterGame.mjs");
 
   mkdirSync(outputDirectory, { recursive: true });
-  writeFileSync(
-    outputPath,
-    code.replaceAll(/from "\.\/([^"]+)"/g, (_, module) =>
-      `from ${JSON.stringify(pathToFileURL(resolve(gameDirectory, `${module}.ts`)).href)}`,
-    ) + "\nexport { DogfightEngine };\n",
-  );
+  // Bundle relative game modules so shared flight code resolves from this cache.
+  buildSync({
+    stdin: {
+      contents: readFileSync(sourcePath, "utf8") + "\nexport { DogfightEngine };\n",
+      resolveDir: gameDirectory,
+      sourcefile: "engine-harness.tsx",
+      loader: "tsx",
+    },
+    bundle: true,
+    packages: "external",
+    platform: "node",
+    format: "esm",
+    target: "es2022",
+    jsx: "automatic",
+    outfile: outputPath,
+  });
 
   return (await import(pathToFileURL(outputPath).href)).DogfightEngine;
 }

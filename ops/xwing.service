@@ -1,0 +1,24 @@
+[Unit]
+Description=Rogue Vector authoritative co-op server
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=xwing
+Group=xwing
+WorkingDirectory=/opt/xwing
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/xwing/database.env
+EnvironmentFile=/etc/xwing/runtime.env
+ExecStart=/opt/xwing/bin/node --max-old-space-size=160 dist/server/index.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=320M
+[Install]
+WantedBy=multi-user.target
