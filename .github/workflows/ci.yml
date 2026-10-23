@@ -7,6 +7,19 @@ jobs:
   code:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: xwing-ci
+          POSTGRES_DB: xwing_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/setup@v3
@@ -15,3 +28,11 @@ jobs:
           cache: true
           require-lockfile: true
       - run: ./shared_checks
+      - name: Verify round persistence
+        env:
+          DATABASE_URL: postgresql://postgres:xwing-ci@localhost:5432/xwing_test
+          MIGRATION_DATABASE_URL: postgresql://postgres:xwing-ci@localhost:5432/xwing_test
+          VERSUS_TEST_DATABASE_URL: postgresql://postgres:xwing-ci@localhost:5432/xwing_test
+        run: |
+          pnpm db:migrate
+          pnpm verify:versus:persistence

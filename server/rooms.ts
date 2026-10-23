@@ -1,5 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { Simulation } from "../shared/simulation";
+import {
+  Simulation,
+  type MatchMode,
+  type ParticipantStats,
+} from "../shared/simulation";
+import { PROTOCOL_VERSION } from "../shared/protocol";
 export const opaque = () => randomBytes(32).toString("base64url");
 export class AdmissionError extends Error {
   constructor(
@@ -19,6 +24,8 @@ export type Slot = {
 };
 export type Room = {
   id: string;
+  matchId: string;
+  completedRound: number;
   invite: string | null;
   squad: string;
   sim: Simulation;
@@ -35,6 +42,8 @@ type Ticket = {
 export type MatchResult = {
   id: string;
   seed: number;
+  mode: MatchMode;
+  winner: string | null;
   squad: string;
   private: boolean;
   status: "active" | "completed" | "interrupted";
@@ -42,7 +51,7 @@ export type MatchResult = {
   endedAt: Date | null;
   score: number;
   wave: number;
-  participants: { id: string; callsign: string; kills: number }[];
+  participants: ParticipantStats[];
 };
 export class Rooms {
   room: Room | null = null;
@@ -75,6 +84,7 @@ export class Rooms {
   admission(
     body: {
       action?: unknown;
+      mode?: unknown;
       callsign?: unknown;
       squad?: unknown;
       invite?: unknown;
@@ -99,6 +109,13 @@ export class Rooms {
         400,
         "Use a callsign of 1–20 letters, numbers, spaces, _ or -.",
       );
+    if (
+      body.mode !== undefined &&
+      body.mode !== "coop" &&
+      body.mode !== "versus"
+    )
+      throw new AdmissionError(400, "Unknown match mode");
+    const mode: MatchMode = body.mode === "versus" ? "versus" : "coop";
     let room = this.room;
     let slot: Slot | undefined;
     if (body.action === "reconnect") {
@@ -129,6 +146,18 @@ export class Rooms {
         409,
         "Server full. A private squad is already flying; try again later.",
       );
+    if (room && body.action === "quick" && room.sim.mode !== mode)
+      throw new AdmissionError(
+        409,
+        `Server occupied by a ${room.sim.mode} room. Try again later.`,
+      );
+    if (
+      room &&
+      (body.action === "invite" || body.action === "reconnect") &&
+      body.mode !== undefined &&
+      room.sim.mode !== mode
+    )
+      throw new AdmissionError(409, "This room uses a different match mode.");
     if (!room) {
       const squad =
         typeof body.squad === "string" &&
@@ -137,9 +166,11 @@ export class Rooms {
           : "Rogue Squadron";
       room = this.room = {
         id: randomUUID(),
+        matchId: randomUUID(),
+        completedRound: 0,
         squad,
         invite: body.action === "private" ? opaque() : null,
-        sim: new Simulation(randomBytes(4).readUInt32LE()),
+        sim: new Simulation(randomBytes(4).readUInt32LE(), mode),
         slots: new Map(),
         startedAt: new Date(this.now()),
       };
@@ -150,6 +181,18 @@ export class Rooms {
         throw new AdmissionError(
           409,
           "Squad full. All four pilot slots are occupied or reserved.",
+        );
+      if (
+        room.sim.mode === "versus" &&
+        room.sim.participants.size +
+          [...room.slots.values()].filter(
+            (s) => !room.sim.participants.has(s.id),
+          ).length >=
+          64
+      )
+        throw new AdmissionError(
+          409,
+          "This round has reached its participant limit. Wait for a rematch or leave and create a new room.",
         );
       slot = {
         id: randomUUID(),
@@ -178,7 +221,8 @@ export class Rooms {
       room: room.id,
       squad: room.squad,
       invite: room.invite,
-      protocol: 1,
+      mode: room.sim.mode,
+      protocol: PROTOCOL_VERSION,
     };
   }
   consume(token: unknown, origin: string) {
@@ -233,24 +277,57 @@ export class Rooms {
         room.slots.delete(key);
       }
     if (room.slots.size === 0) {
-      this.persist(this.result(room, "completed"));
+      if (
+        room.sim.phase !== "results" ||
+        room.completedRound !== room.sim.round
+      )
+        this.persist(
+          this.result(
+            room,
+            room.sim.mode === "coop" || room.sim.phase === "results"
+              ? "completed"
+              : "interrupted",
+          ),
+        );
       this.room = null;
     }
   }
+  step() {
+    const room = this.room;
+    if (!room) return;
+    const round = room.sim.round;
+    room.sim.step();
+    if (room.sim.round !== round) {
+      room.matchId = randomUUID();
+      room.startedAt = new Date(this.now());
+      this.persist(this.result(room, "active"));
+    }
+    if (
+      room.sim.phase === "results" &&
+      room.completedRound !== room.sim.round
+    ) {
+      room.completedRound = room.sim.round;
+      this.persist(this.result(room, "completed"));
+    }
+  }
   checkpoint() {
-    if (this.room) this.persist(this.result(this.room, "active"));
+    if (this.room && this.room.sim.phase !== "results")
+      this.persist(this.result(this.room, "active"));
   }
   drain() {
     this.draining = true;
     if (this.room) {
-      this.persist(this.result(this.room, "interrupted"));
+      if (this.room.sim.phase !== "results")
+        this.persist(this.result(this.room, "interrupted"));
       this.room = null;
     }
     this.tickets.clear();
   }
   private result(room: Room, status: MatchResult["status"]): MatchResult {
     return {
-      id: room.id,
+      id: room.matchId,
+      mode: room.sim.mode,
+      winner: room.sim.winner,
       seed: room.sim.seed,
       squad: room.squad,
       private: !!room.invite,

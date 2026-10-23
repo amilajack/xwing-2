@@ -242,3 +242,44 @@ The initial ARM capacity run was stopped early at the user's request after
 mean host CPU 0.173 cores, maximum host memory usage 62.3%. This is partial
 capacity evidence, not a completed 30-minute acceptance run, and predates the
 additional squadrons.
+
+### Versus mode
+
+Choose **Versus** in the multiplayer lobby for a public free-for-all, or create
+and share a private versus room. Up to four pilots fight alongside the existing
+AI waves and four extra TIE fighters per pilot. Only human kills count toward
+the first-to-ten victory; the scoreboard lists AI kills and points separately.
+
+A round waits for two connected pilots. Pilots can join in progress, respawn in
+five seconds, and receive two seconds of spawn protection that ends on firing.
+Disconnected ships stay vulnerable during the existing 15-second reservation.
+After a victory, combat freezes for a ten-second results screen, followed by a
+fresh round over the same connections. A rematch waits if fewer than two pilots
+are connected. Departed standings are retained for the current round. Admission
+is bounded to 64 distinct pilots per versus round, including reservations;
+reconnects remain available at this limit.
+
+The single-room server matches Quick Join to the selected mode and returns a
+clear occupancy error when another mode is flying. Invites and reconnects use
+the room's authoritative mode. Single-player and co-op damage rules are unchanged.
+
+This change uses protocol **2** and adds a Prisma migration for round mode,
+winner, human kills, deaths, and AI points. Participant identity is now scoped
+to a match, allowing the same pilot in successive rounds. Apply migrations
+before starting the new backend and publish the matching frontend in the same
+release window; old clients must refresh. This stacked PR does not deploy either
+production application.
+
+For local verification, use an isolated PostgreSQL database with both migrations
+applied. Never point the test scripts at the production database:
+
+```bash
+VERSUS_TEST_DATABASE_URL='postgresql://…' pnpm verify:versus:persistence
+GAME_URL=http://127.0.0.1:3217 COOP_API=http://127.0.0.1:8187 \
+  PLAYWRIGHT_HEADED=1 VERSUS_TEST_DATABASE_URL='postgresql://…' pnpm verify:versus
+```
+
+The browser test uses the existing loopback-only QA endpoint and local certificate
+pinning. It verifies actual WebTransport combat, respawn, reconnect, victory,
+persisted results, automatic rematches, and private invites at 1440×900, with
+screenshots and structured state saved under `outputs/versus-playwright/`.

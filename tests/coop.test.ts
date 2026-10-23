@@ -12,6 +12,7 @@ import {
 import { FlightDynamics } from "../shared/flight";
 import {
   neutralControls,
+  PROTOCOL_VERSION,
   validControls,
   snapshotPackets,
   SnapshotAssembler,
@@ -208,6 +209,8 @@ test("database outages never block simulation and the queue is bounded", async (
   for (let i = 0; i < 100; i++)
     p.enqueue({
       id: String(i),
+      mode: "coop",
+      winner: null,
       seed: 1,
       squad: "S",
       private: false,
@@ -248,7 +251,12 @@ test("a saturated four-pilot world fits the initial reliable frame and datagram 
   }));
   const state = s.snapshot();
   assert.doesNotThrow(() =>
-    reliableMessage({ type: "welcome", protocol: 1, pilot: owner, state }),
+    reliableMessage({
+      type: "welcome",
+      protocol: PROTOCOL_VERSION,
+      pilot: owner,
+      state,
+    }),
   );
   const packets = snapshotPackets(1, state);
   assert.ok(packets.length <= 128);

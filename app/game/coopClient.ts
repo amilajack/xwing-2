@@ -3,6 +3,7 @@ import {
   advancePilot,
   restoreFlight,
   type WorldSnapshot,
+  type MatchMode,
 } from "../../shared/simulation";
 import {
   encode,
@@ -70,11 +71,12 @@ export class CoopClient {
     callsign: string,
     squad: string,
     invite?: string,
+    mode?: MatchMode,
   ) {
     this.callsign = callsign;
     if (typeof window.WebTransport !== "function" || !window.isSecureContext)
       throw new Error(
-        "Co-op needs a browser with WebTransport (try current Chrome or Edge) and HTTPS. Single-player remains available.",
+        "Multiplayer needs a browser with WebTransport (try current Chrome or Edge) and HTTPS. Single-player remains available.",
       );
     if (action === "reconnect")
       this.reconnectToken = sessionStorage.getItem("xwing-reconnect") ?? "";
@@ -82,6 +84,10 @@ export class CoopClient {
       action,
       callsign,
       squad,
+      mode:
+        action === "quick" || action === "private"
+          ? (mode ?? "coop")
+          : undefined,
       invite,
       reconnect: this.reconnectToken,
     });
@@ -188,6 +194,8 @@ export class CoopClient {
             this.previous = null;
             this.acceptSnapshot(m.state);
             this.publish();
+          } else if (m.type === "round") {
+            this.acceptSnapshot(m.state);
           } else if (m.type === "draining") {
             this.stopped = true;
             this.view.status = "error";
@@ -224,16 +232,23 @@ export class CoopClient {
       return;
     const local = state.pilots.find((p) => p.id === this.view.pilot);
     if (!local) return;
-    this.previous = this.view.state;
+    const changedRound = this.view.state?.round !== state.round;
+    const changedPhase = this.view.state?.phase !== state.phase;
+    this.previous = changedRound || changedPhase ? null : this.view.state;
+    if (changedRound || changedPhase) {
+      this.pending = [];
+      this.maneuver = null;
+      this.accumulator = 0;
+    }
     this.view.state = state;
     this.receivedAt = performance.now();
     this.lastSnapshot = this.receivedAt;
     restoreFlight(this.flight, local.flight);
     this.pending =
-      local.hull > 0
+      local.hull > 0 && state.phase === "active"
         ? this.pending.filter((input) => input.seq > local.ack)
         : [];
-    if (local.hull > 0)
+    if (local.hull > 0 && state.phase === "active")
       for (const input of this.pending) advancePilot(this.flight, input);
     this.publish();
   }
@@ -271,7 +286,7 @@ export class CoopClient {
       const local = this.view.state.pilots.find(
         (p) => p.id === this.view.pilot,
       );
-      if (local && local.hull > 0) {
+      if (local && local.hull > 0 && this.view.state.phase === "active") {
         advancePilot(this.flight, this.input);
         this.pending.push({ ...this.input });
       }

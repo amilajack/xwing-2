@@ -68,7 +68,7 @@ try {
   );
   const page = await context.newPage();
   await page.goto(`${origin}/__protocol`);
-  const connect = async (id, ticket, protocol = 1) =>
+  const connect = async (id, ticket, protocol = 2) =>
     page.evaluate(
       async ({ id, ticket, protocol, transport, hash }) => {
         const wt = new WebTransport(transport, {
@@ -136,7 +136,7 @@ try {
     await page.evaluate(
       (v) =>
         window.sessions.valid.datagrams.write(
-          new TextEncoder().encode(JSON.stringify({ protocol: 1, input: v })),
+          new TextEncoder().encode(JSON.stringify({ protocol: 2, input: v })),
         ),
       v,
     );
@@ -148,7 +148,7 @@ try {
     window.sessions.valid.datagrams
       .write(
         new TextEncoder().encode(
-          '{"protocol":1,"input":{"seq":2,"x":"invalid"}}',
+          '{"protocol":2,"input":{"seq":2,"x":"invalid"}}',
         ),
       )
       .catch(() => {}),

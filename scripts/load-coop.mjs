@@ -71,7 +71,7 @@ try {
         const enc = new TextEncoder();
         await writer.write(
           enc.encode(
-            JSON.stringify({ type: "join", protocol: 1, ticket: a.ticket }) +
+            JSON.stringify({ type: "join", protocol: 2, ticket: a.ticket }) +
               "\n",
           ),
         );
@@ -107,9 +107,19 @@ try {
             stats.packets++;
             stats.bytes += value.length;
             if (value.length >= 12) {
-              const tick = new DataView(value.buffer,value.byteOffset,value.byteLength).getUint32(4);
-              if (stats.firstTick === null) { stats.firstTick = tick; stats.firstTickAt = now; }
-              if (tick > stats.lastTick) { stats.lastTick = tick; stats.lastTickAt = now; }
+              const tick = new DataView(
+                value.buffer,
+                value.byteOffset,
+                value.byteLength,
+              ).getUint32(4);
+              if (stats.firstTick === null) {
+                stats.firstTick = tick;
+                stats.firstTickAt = now;
+              }
+              if (tick > stats.lastTick) {
+                stats.lastTick = tick;
+                stats.lastTickAt = now;
+              }
             }
           }
         })().catch((e) => stats.errors.push(String(e)));
@@ -133,7 +143,7 @@ try {
             direction: i % 2 ? -1 : 1,
           };
           void dw
-            .write(enc.encode(JSON.stringify({ protocol: 1, input })))
+            .write(enc.encode(JSON.stringify({ protocol: 2, input })))
             .then(() => stats.inputs++)
             .catch((e) => stats.errors.push(String(e)))
             .finally(() => (busy = false));
@@ -185,10 +195,17 @@ try {
       `Capacity clients healthy: ${Math.round((Date.now() - start) / 1000)}/${seconds}s`,
     );
   }
-  const final = await Promise.all(pages.map(p => p.evaluate(() => window.loadStats)));
+  const final = await Promise.all(
+    pages.map((p) => p.evaluate(() => window.loadStats)),
+  );
   for (const stats of final) {
-    const hz = (stats.lastTick-stats.firstTick)/((stats.lastTickAt-stats.firstTickAt)/1000);
-    assert.ok(hz >= 58.5, `authoritative simulation fell behind: ${hz.toFixed(2)} Hz`);
+    const hz =
+      (stats.lastTick - stats.firstTick) /
+      ((stats.lastTickAt - stats.firstTickAt) / 1000);
+    assert.ok(
+      hz >= 58.5,
+      `authoritative simulation fell behind: ${hz.toFixed(2)} Hz`,
+    );
   }
   for (const p of pages) await p.evaluate(() => window.stopLoad());
   console.log("Four-pilot capacity transport test passed");
