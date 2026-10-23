@@ -318,14 +318,16 @@ const PLAYER_ENGINE_NOZZLES = [
 );
 
 /**
- * The vacuum of space would leave no smoke or air-shaped flame,
- * and the thin plume is nearly invisible end-on from the chase camera,
- * so what reads is the nozzle itself: boost runs it hotter,
- * brightening its glow from orange toward blue-white.
+ * The vacuum of space would leave no smoke or air-shaped flame, and the thin
+ * plume is nearly invisible end-on from the chase camera, so what reads is the
+ * nozzle itself, styled after the films: a red-orange halo around a white-hot
+ * core that flickers, and on boost burns brighter behind a crisp lens flare.
  */
-const EXHAUST_CRUISE_COLOR = new THREE.Color(0xff8a5c);
-const EXHAUST_BOOST_COLOR = new THREE.Color(0xb8e4ff);
-const EXHAUST_GLOW_SIZE = 5;
+const EXHAUST_HALO_COLOR = new THREE.Color(0xff5a2e);
+const EXHAUST_CORE_COLOR = new THREE.Color(0xffe6d2);
+const EXHAUST_HALO_SIZE = 6;
+const EXHAUST_CORE_SIZE = 2.6;
+const EXHAUST_FLARE_LENGTH = 34;
 
 // Player bolts converge on the locked target's range (or this default), so
 // both wingtip cannons hit what sits under the reticle.
@@ -654,6 +656,25 @@ function makeGlowTexture() {
   return texture;
 }
 
+/** A white glow for materials to tint, unlike the blue-painted one. */
+function makeNeutralGlowTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const context = canvas.getContext("2d");
+  if (context) {
+    const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gradient.addColorStop(0, "rgba(255,255,255,1)");
+    gradient.addColorStop(0.3, "rgba(255,255,255,.5)");
+    gradient.addColorStop(1, "rgba(255,255,255,0)");
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, 64, 64);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
 function makeSunTexture() {
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
@@ -695,6 +716,7 @@ class SharedAssets {
     emissiveIntensity: 0.8,
   });
   readonly glowTexture = makeGlowTexture();
+  readonly neutralGlowTexture = makeNeutralGlowTexture();
   readonly sunTexture = makeSunTexture();
 
   dispose() {
@@ -702,6 +724,7 @@ class SharedAssets {
     this.playerHull.dispose();
     this.canopy.dispose();
     this.glowTexture.dispose();
+    this.neutralGlowTexture.dispose();
     this.sunTexture.dispose();
   }
 }
@@ -1335,7 +1358,11 @@ class DogfightEngine {
    * Rolls with the model, which banks inside the flight frame.
    */
   private exhaustMount = new THREE.Group();
-  private exhaustGlows: THREE.Sprite[] = [];
+  private exhaustLayers: Record<"halo" | "core" | "flare", THREE.Sprite[]> = {
+    halo: [],
+    core: [],
+    flare: [],
+  };
   private touchFire = false;
   private touchBoost = false;
   private touchSteeringActive = false;
@@ -3367,21 +3394,23 @@ class DogfightEngine {
   }
 
   private buildExhausts() {
-    const material = new THREE.SpriteMaterial({
-      map: this.assets.glowTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      toneMapped: false,
-    });
+    for (const [layer, sprites] of Object.entries(this.exhaustLayers)) {
+      const material = new THREE.SpriteMaterial({
+        map: this.assets.neutralGlowTexture,
+        color: layer === "core" ? EXHAUST_CORE_COLOR : EXHAUST_HALO_COLOR,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        toneMapped: false,
+      });
 
-    for (const nozzle of PLAYER_ENGINE_NOZZLES) {
-      const glow = new THREE.Sprite(material);
+      for (const nozzle of PLAYER_ENGINE_NOZZLES) {
+        const sprite = new THREE.Sprite(material);
 
-      glow.position.copy(nozzle);
-
-      this.exhaustMount.add(glow);
-      this.exhaustGlows.push(glow);
+        sprite.position.copy(nozzle);
+        this.exhaustMount.add(sprite);
+        sprites.push(sprite);
+      }
     }
 
     this.player.add(this.exhaustMount);
@@ -3390,14 +3419,21 @@ class DogfightEngine {
 
   private updateExhausts() {
     const boost = this.boostBlend;
-    const material = this.exhaustGlows[0].material;
+    const { halo, core, flare } = this.exhaustLayers;
+    // Sines rather than noise, so the flicker replays identically in tests.
+    const flicker =
+      1 + 0.07 * Math.sin(this.elapsed * 47) + 0.05 * Math.sin(this.elapsed * 83);
 
     this.exhaustMount.rotation.z = this.playerModel.rotation.z;
-    material.color.lerpColors(EXHAUST_CRUISE_COLOR, EXHAUST_BOOST_COLOR, boost);
-    material.opacity = 0.3 + boost * 0.6;
+    halo[0].material.opacity = (0.45 + boost * 0.55) * flicker;
+    core[0].material.opacity = (0.5 + boost * 0.5) * flicker;
+    flare[0].material.opacity = boost * 0.7 * flicker;
 
-    for (const glow of this.exhaustGlows) {
-      glow.scale.setScalar(EXHAUST_GLOW_SIZE * (1 + boost * 0.5));
+    for (let index = 0; index < PLAYER_ENGINE_NOZZLES.length; index += 1) {
+      halo[index].scale.setScalar(EXHAUST_HALO_SIZE * (1 + boost * 0.6) * flicker);
+      core[index].scale.setScalar(EXHAUST_CORE_SIZE * (1 + boost * 0.4));
+      flare[index].visible = boost > 0.01;
+      flare[index].scale.set(EXHAUST_FLARE_LENGTH * boost, 0.5, 1);
     }
   }
 
