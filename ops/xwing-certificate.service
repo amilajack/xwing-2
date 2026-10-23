@@ -1,0 +1,5 @@
+[Unit]
+Description=Renew and back up Rogue Vector TLS certificate
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xwing-certificate

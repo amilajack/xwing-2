@@ -64,10 +64,10 @@ test("can be added to the iPhone Home Screen and launched without Safari's bars"
 test("keeps performance-critical systems explicit and bounded", async () => {
   const [source, importer, page, site, globalCss, packageJson] =
     await Promise.all([
-      readFile(
-        new URL("../app/game/StarfighterGame.tsx", import.meta.url),
-        "utf8",
-      ),
+      Promise.all([
+        readFile(new URL("../app/game/StarfighterGame.tsx", import.meta.url), "utf8"),
+        readFile(new URL("../shared/flight.ts", import.meta.url), "utf8"),
+      ]).then((sources) => sources.join("\n")),
       readFile(
         new URL("../scripts/fetch-sketchfab-assets.mjs", import.meta.url),
         "utf8",
@@ -93,7 +93,7 @@ test("keeps performance-critical systems explicit and bounded", async () => {
   assert.match(source, /<canvas ref=\{canvasRef\}/);
   assert.doesNotMatch(source, /@react-three\/fiber|r3f-perf|useThree|useFrame/);
   assert.match(source, /settings\.quality === "low" \? "low" : "high"/);
-  assert.match(source, /const MAX_ENEMIES = 20/);
+  assert.match(source, /const MAX_ENEMIES = 34/);
   assert.match(source, /const MAX_PROJECTILES = 320/);
   assert.match(source, /const MAX_EXPLOSIONS = 32/);
   assert.match(source, /new THREE\.InstancedMesh/);

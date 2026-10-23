@@ -1,0 +1,58 @@
+#!/bin/bash
+set -euo pipefail
+# Use the prebuilt AWS CLI; installing a package manager dependency graph on a
+# small instance is unnecessary. Ubuntu 24.04 supplies glibc required by QUIC.
+if ! command -v aws >/dev/null; then
+  curl -fsSL --connect-timeout 10 --max-time 120 https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip -o /tmp/awscli.zip
+  python3 - <<'PYCLI'
+import zipfile, os
+with zipfile.ZipFile('/tmp/awscli.zip') as z:
+    z.extractall('/tmp/xwing-awscli')
+    for item in z.infolist():
+        mode = item.external_attr >> 16
+        if mode: os.chmod('/tmp/xwing-awscli/' + item.filename, mode)
+PYCLI
+  /tmp/xwing-awscli/aws/install
+fi
+TOKEN=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' http://169.254.169.254/latest/api/token)
+INSTANCE=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+aws ec2 associate-address --region us-west-1 --allocation-id '${allocation}' --instance-id "$INSTANCE" --allow-reassociation
+id xwing >/dev/null 2>&1 || useradd --system --home /opt/xwing --shell /usr/sbin/nologin xwing
+mkdir -p /opt/xwing /etc/xwing/tls /var/lib/xwing-acme
+RELEASE_VERSION=$(aws s3api head-object --bucket '${bucket}' --key '${key}' --query VersionId --output text --region us-west-1)
+aws s3api get-object --bucket '${bucket}' --key '${key}' --version-id "$RELEASE_VERSION" /opt/xwing/release.tar.gz --region us-west-1 >/dev/null
+cd /opt/xwing
+tar xzf release.tar.gz
+cat > /etc/xwing/deployment <<'CONFIG'
+BUCKET=${bucket}
+HOSTNAME=${hostname}
+ACME_EMAIL=${email}
+ALLOWED_ORIGINS=${origins}
+CONFIG
+install -m 755 ops/release.sh /usr/local/bin/xwing-release
+install -m 755 ops/certificate.sh /usr/local/bin/xwing-certificate
+# Binary tools are installed before any game process starts; no builds on the nano.
+curl -fsSL --connect-timeout 10 --max-time 90 https://github.com/go-acme/lego/releases/download/v4.26.0/lego_v4.26.0_linux_arm64.tar.gz | tar xz -C /usr/local/bin lego
+curl -fsSL --connect-timeout 10 --max-time 90 https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_arm64.tar.gz | tar xz -C /usr/local/bin caddy
+chmod 755 /usr/local/bin/caddy
+if aws s3 cp 's3://${bucket}/certificates/tls.tar.gz' /tmp/tls.tar.gz --region us-west-1; then tar xzf /tmp/tls.tar.gz -C /var/lib/xwing-acme; fi
+/usr/local/bin/xwing-certificate
+cp ops/xwing.service ops/xwing-proxy.service ops/xwing-certificate.service ops/xwing-certificate.timer /etc/systemd/system/
+cat > /etc/xwing/Caddyfile <<'CADDY'
+{
+  auto_https off
+  servers {
+    protocols h1 h2
+  }
+}
+https://${hostname} {
+  tls /etc/xwing/tls/cert.pem /etc/xwing/tls/key.pem
+  reverse_proxy 127.0.0.1:8080
+}
+CADDY
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=32M\nRuntimeMaxUse=16M\n' > /etc/systemd/journald.conf.d/xwing.conf
+systemctl restart systemd-journald
+systemctl daemon-reload
+/usr/local/bin/xwing-release --installed
+systemctl enable --now xwing-proxy xwing-certificate.timer

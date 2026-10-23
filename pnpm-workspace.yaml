@@ -3,3 +3,7 @@ allowBuilds:
   sharp: true
   unrs-resolver: true
   workerd: true
+  '@fails-components/webtransport-transport-http3-quiche': true
+  '@prisma/client': true
+  '@prisma/engines': true
+  prisma: true
