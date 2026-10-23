@@ -1,20 +1,12 @@
 "use client";
 
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import {
-  Canvas,
-  useFrame,
-  useThree,
-  type GLProps,
-} from "@react-three/fiber";
 import * as THREE from "three";
 import { deviceTiltFromOrientation, type DeviceTilt } from "./deviceTilt";
 import {
@@ -34,6 +26,10 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 declare global {
   interface Window {
+    __gameTest?: {
+      ready: boolean;
+      getState: () => ReturnType<NonNullable<Window["__rogueVectorQa"]>["snapshot"]>;
+    };
     __rogueVectorQa?: {
       stageFleet: () => void;
       simulateGyro: (beta: number, gamma: number) => void;
@@ -248,15 +244,6 @@ const QUALITY_PRESETS: Record<Exclude<QualityName, "custom">, GraphicsSettings> 
 const DEFAULT_SETTINGS = QUALITY_PRESETS.ultra;
 const SETTINGS_KEY = "rogue-vector-settings-v2";
 const SCORE_KEY = "rogue-vector-high-score";
-const IS_DEVELOPMENT = process.env.NODE_ENV === "development";
-const DevelopmentPerf =
-  IS_DEVELOPMENT && typeof window !== "undefined"
-    ? lazy(() =>
-        import("r3f-perf").then(({ Perf }) => ({
-          default: Perf,
-        })),
-      )
-    : null;
 const FIXED_STEP = 1 / 60;
 const NO_FLIGHT_INPUT: FlightInput = { fire: false, boost: false };
 const MAX_ENEMIES = 20;
@@ -347,9 +334,8 @@ type ShipModelLibrary = {
   asteroid: THREE.Mesh;
 };
 
-const createWebGL2Renderer: GLProps = ({ canvas }) => {
-  const htmlCanvas = canvas as HTMLCanvasElement;
-  const context = htmlCanvas.getContext("webgl2", {
+const createWebGL2Renderer = (canvas: HTMLCanvasElement) => {
+  const context = canvas.getContext("webgl2", {
     alpha: false,
     antialias: false,
     depth: true,
@@ -361,7 +347,7 @@ const createWebGL2Renderer: GLProps = ({ canvas }) => {
   return new THREE.WebGLRenderer({
     alpha: false,
     antialias: false,
-    canvas: htmlCanvas,
+    canvas,
     context,
     powerPreference: "high-performance",
   });
@@ -1421,7 +1407,7 @@ class DogfightEngine {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.45;
     this.renderer.setClearColor(0x030b14, 1);
-    this.renderer.info.autoReset = !IS_DEVELOPMENT;
+    this.renderer.info.autoReset = true;
     this.scene.fog = new THREE.FogExp2(0x06111d, 0.00052);
 
     this.buildWorld();
@@ -1570,6 +1556,10 @@ class DogfightEngine {
           },
         };
       },
+    };
+    window.__gameTest = {
+      ready: true,
+      getState: window.__rogueVectorQa.snapshot,
     };
   }
 
@@ -3669,6 +3659,7 @@ class DogfightEngine {
     this.assets.dispose();
     disposeModelLibrary(this.modelLibrary);
     if (window.__rogueVectorQa) delete window.__rogueVectorQa;
+    delete window.__gameTest;
   }
 }
 
@@ -3681,24 +3672,26 @@ function GameRuntime({
   callbacks: GameCallbacks;
   engineRef: { current: DogfightEngine | null };
 }) {
-  const renderer = useThree((state) => state.gl) as THREE.WebGLRenderer;
-  const scene = useThree((state) => state.scene);
-  const camera = useThree((state) => state.camera) as THREE.PerspectiveCamera;
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const runtimeRef = useRef<DogfightEngine | null>(null);
   const latestSettings = useRef(settings);
 
-  useFrame((state, delta) => {
-    runtimeRef.current?.frame(state.clock.elapsedTime * 1000, delta);
-  }, 1);
-
   useEffect(() => {
-    let cancelled = false;
-    let localEngine: DogfightEngine | null = null;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    if (!(renderer instanceof THREE.WebGLRenderer)) {
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = createWebGL2Renderer(canvas);
+    } catch {
       callbacks.onStatus("unsupported");
       return;
     }
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(67, 1, 0.1, 2200);
+    let cancelled = false;
+    let localEngine: DogfightEngine | null = null;
+    let animationFrame = 0;
 
     const isTouchDevice =
       "ontouchstart" in window || navigator.maxTouchPoints > 0;
@@ -3719,6 +3712,14 @@ function GameRuntime({
         localEngine = engine;
         runtimeRef.current = engine;
         engineRef.current = engine;
+        let previousTime = performance.now();
+        const animate = (now: number) => {
+          if (cancelled) return;
+          engine.frame(now, (now - previousTime) / 1000);
+          previousTime = now;
+          animationFrame = requestAnimationFrame(animate);
+        };
+        animationFrame = requestAnimationFrame(animate);
         callbacks.onStatus("menu");
       })
       .catch(() => {
@@ -3727,28 +3728,20 @@ function GameRuntime({
 
     return () => {
       cancelled = true;
+      cancelAnimationFrame(animationFrame);
       localEngine?.dispose();
       if (runtimeRef.current === localEngine) runtimeRef.current = null;
       if (engineRef.current === localEngine) engineRef.current = null;
+      renderer.dispose();
     };
-  }, [callbacks, camera, engineRef, renderer, scene]);
+  }, [callbacks, engineRef]);
 
   useEffect(() => {
     latestSettings.current = settings;
     runtimeRef.current?.applySettings(settings);
   }, [settings]);
 
-  return DevelopmentPerf ? (
-    <Suspense fallback={null}>
-      <DevelopmentPerf
-        className="development-r3f-perf"
-        position="top-left"
-        minimal
-        showGraph={false}
-        logsPerSecond={8}
-      />
-    </Suspense>
-  ) : null;
+  return <canvas ref={canvasRef} className="game-renderer" />;
 }
 
 function SettingsPanel({
@@ -4343,9 +4336,7 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
       )}
 
       {hud.diagnostics && (
-        <div
-          className={`perf-panel ${IS_DEVELOPMENT ? "with-r3f-perf" : ""}`}
-        >
+        <div className="perf-panel">
           <div>
             <span>FPS</span>
             <b>{hud.fps.toFixed(0)}</b>
@@ -4497,17 +4488,11 @@ export function StarfighterGame() {
         className={`game-canvas ${status !== "playing" ? "is-paused" : ""}`}
         aria-label="Rogue Vector 3D starfighter combat"
       >
-        <Canvas
-          camera={{ fov: 67, near: 0.1, far: 2200 }}
-          dpr={1}
-          gl={createWebGL2Renderer}
-        >
-          <GameRuntime
-            settings={settings}
-            callbacks={callbacks}
-            engineRef={engineRef}
-          />
-        </Canvas>
+        <GameRuntime
+          settings={settings}
+          callbacks={callbacks}
+          engineRef={engineRef}
+        />
       </div>
       <div className="vignette" />
       <div className="scanlines" />

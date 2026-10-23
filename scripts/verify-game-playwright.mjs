@@ -44,7 +44,7 @@ page.on("response", (response) => {
 });
 
 const snapshot = () =>
-  page.evaluate(() => window.__rogueVectorQa?.snapshot());
+  page.evaluate(() => window.__gameTest?.getState());
 const forwardDot = (a, b) =>
   a.playerForward.reduce(
     (sum, component, index) => sum + component * b.playerForward[index],
@@ -113,6 +113,7 @@ async function readFramebufferStats() {
 let report;
 try {
   await page.goto(`${baseUrl}/?qa=1`, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => window.__gameTest?.ready);
   const launch = page.getByRole("button", { name: "Launch fighter" });
   await launch.waitFor({ state: "visible" });
   assert.equal(
@@ -249,24 +250,6 @@ try {
     resumedGyroSnapshot?.gyro.baseline,
     false,
     "resume retained stale gyro calibration",
-  );
-  const developmentPerf = page.locator(".development-r3f-perf");
-  await developmentPerf.waitFor({ state: "visible" });
-  await page.waitForTimeout(900);
-  const developmentPerfText = await developmentPerf.innerText();
-  assert.match(
-    developmentPerfText,
-    /GPU[\s\S]*CPU[\s\S]*FPS/,
-    "r3f-perf did not render its GPU, CPU, and FPS labels",
-  );
-  const perfCanvas = developmentPerf.locator("canvas");
-  const perfFrameA = await perfCanvas.screenshot();
-  await page.waitForTimeout(650);
-  const perfFrameB = await perfCanvas.screenshot();
-  assert.notEqual(
-    hash(perfFrameA),
-    hash(perfFrameB),
-    "r3f-perf did not update its live performance graph",
   );
   await page.screenshot({
     path: resolve(outputDirectory, "03-combat-stable.png"),
@@ -503,8 +486,6 @@ try {
     url: page.url(),
     title: await page.title(),
     defaultQuality,
-    developmentPerfText,
-    developmentPerfFrameChanged: hash(perfFrameA) !== hash(perfFrameB),
     responsiveViewportChecks,
     idleFrameChanged: hash(menuFrameA) !== hash(menuFrameB),
     combatFrameChanged: hash(flightFrameA) !== hash(flightFrameB),

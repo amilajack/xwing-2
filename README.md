@@ -52,8 +52,8 @@ pnpm run verify:browser
 build and tests. `pnpm install` installs the version-controlled pre-commit hook,
 which runs the same checks and blocks commits on failure.
 
-The pnpm patch for `r3f-perf` removes invalid font source-map references so
-Turbopack can compile the development diagnostics; font data is unchanged.
+The game owns its Three.js renderer and animation loop directly. Press P in
+flight to inspect frame timing, draw calls, triangles, and render scale.
 
 The browser verification launches headed Chrome through Playwright so Ultra
 uses the Mac GPU instead of headless Chromium's software SwiftShader renderer.

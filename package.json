@@ -21,7 +21,6 @@
     "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
-    "@react-three/fiber": "^9.6.1",
     "next": "^16.2.11",
     "react": "19.2.6",
     "react-dom": "19.2.6",
@@ -40,7 +39,6 @@
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
     "playwright": "^1.62.0",
-    "r3f-perf": "^7.2.3",
     "react-server-dom-webpack": "19.2.6",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",

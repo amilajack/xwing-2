@@ -3,5 +3,3 @@ allowBuilds:
   sharp: true
   unrs-resolver: true
   workerd: true
-patchedDependencies:
-  r3f-perf@7.2.3: patches/r3f-perf@7.2.3.patch

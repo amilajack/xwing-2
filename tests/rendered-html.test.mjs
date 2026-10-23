@@ -86,10 +86,12 @@ test("keeps performance-critical systems explicit and bounded", async () => {
   assert.match(source, /\/models\/stealth-bomber-high\.glb/);
   assert.match(source, /\/models\/asteroid-high\.glb/);
   assert.match(source, /const DEFAULT_SETTINGS = QUALITY_PRESETS\.ultra/);
-  assert.match(source, /process\.env\.NODE_ENV === "development"/);
-  assert.match(source, /import\("r3f-perf"\)/);
-  assert.match(source, /development-r3f-perf/);
-  assert.match(source, /<Canvas/);
+  assert.match(source, /new THREE\.WebGLRenderer/);
+  assert.match(source, /requestAnimationFrame\(animate\)/);
+  assert.match(source, /cancelAnimationFrame\(animationFrame\)/);
+  assert.match(source, /renderer\.dispose\(\)/);
+  assert.match(source, /<canvas ref=\{canvasRef\}/);
+  assert.doesNotMatch(source, /@react-three\/fiber|r3f-perf|useThree|useFrame/);
   assert.match(source, /settings\.quality === "low" \? "low" : "high"/);
   assert.match(source, /const MAX_ENEMIES = 20/);
   assert.match(source, /const MAX_PROJECTILES = 320/);
@@ -118,8 +120,7 @@ test("keeps performance-critical systems explicit and bounded", async () => {
   assert.match(globalCss, /top: var\(--viewport-offset-top/);
   assert.match(globalCss, /height: var\(--viewport-height/);
   assert.match(packageJson, /"three":/);
-  assert.match(packageJson, /"@react-three\/fiber":/);
-  assert.match(packageJson, /"r3f-perf":/);
+  assert.doesNotMatch(packageJson, /@react-three\/fiber|r3f-perf/);
   assert.match(packageJson, /"assets:sketchfab":/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton|drizzle/);
   for (const uid of [
