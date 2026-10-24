@@ -30,3 +30,10 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# Multiplayer infrastructure local state and plan files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars.json
+*.tfplan

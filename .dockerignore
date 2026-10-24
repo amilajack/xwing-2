@@ -1,0 +1,4 @@
+*
+!ops/**
+!prisma/**
+!dist/**

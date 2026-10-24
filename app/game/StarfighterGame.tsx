@@ -6,20 +6,26 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import * as THREE from "three";
+import { CoopClient, type CoopView } from "./coopClient";
+import { collisionMap, offset } from "../../shared/simulation";
+import { neutralControls } from "../../shared/protocol";
+import {
+  damageLayers,
+  enemyStats,
+  enemyPoints,
+  enemyHeading,
+  enemyTurnRate,
+  waveComposition,
+} from "../../shared/combat";
+import { FlightDynamics } from "../../shared/flight";
 import { deviceTiltFromOrientation, type DeviceTilt } from "./deviceTilt";
 import {
-  BARREL_ROLL_COOLDOWN,
   BARREL_ROLL_DEFLECT_RADIUS,
-  BRAKE_SPEED_FACTOR,
-  BRAKE_TURN_FACTOR,
   isDoubleTap,
-  MANEUVER_DURATION,
-  MANEUVER_METER_COST,
-  maneuverPose,
   type ManeuverKind,
-  type ManeuverPose,
 } from "./maneuvers";
 import { leadTargetPoint, segmentHitsSphere } from "./combatMath";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -28,7 +34,10 @@ declare global {
   interface Window {
     __gameTest?: {
       ready: boolean;
-      getState: () => ReturnType<NonNullable<Window["__rogueVectorQa"]>["snapshot"]>;
+      disconnect?: () => void;
+      getState: () => ReturnType<
+        NonNullable<Window["__rogueVectorQa"]>["snapshot"]
+      > & { multiplayer: CoopView | null };
     };
     __rogueVectorQa?: {
       stageFleet: () => void;
@@ -83,11 +92,7 @@ type GameStatus =
 type QualityName = "low" | "medium" | "high" | "ultra" | "custom";
 type EnemyKind = "fighter" | "interceptor" | "bomber";
 type GyroPermissionState =
-  | "unavailable"
-  | "prompt"
-  | "requesting"
-  | "granted"
-  | "denied";
+  "unavailable" | "prompt" | "requesting" | "granted" | "denied";
 type WakeLockHandle = { release: () => Promise<void> };
 type WakeLockManager = {
   request: (type: "screen") => Promise<WakeLockHandle>;
@@ -181,72 +186,74 @@ type HudSnapshot = {
   onCalibrateGyro?: () => void;
 };
 
-const QUALITY_PRESETS: Record<Exclude<QualityName, "custom">, GraphicsSettings> =
-  {
-    low: {
-      quality: "low",
-      renderScale: 0.65,
-      maxDpr: 1,
-      targetFps: 60,
-      autoResolution: true,
-      shadows: false,
-      effects: 0.45,
-      asteroidCount: 130,
-      starCount: 1400,
-      sensitivity: 1,
-      invertY: false,
-      muted: false,
-    },
-    medium: {
-      quality: "medium",
-      renderScale: 0.82,
-      maxDpr: 1.25,
-      targetFps: 60,
-      autoResolution: true,
-      shadows: false,
-      effects: 0.7,
-      asteroidCount: 240,
-      starCount: 2600,
-      sensitivity: 1,
-      invertY: false,
-      muted: false,
-    },
-    high: {
-      quality: "high",
-      renderScale: 1,
-      maxDpr: 1.5,
-      targetFps: 60,
-      autoResolution: true,
-      shadows: true,
-      effects: 0.9,
-      asteroidCount: 380,
-      starCount: 4200,
-      sensitivity: 1,
-      invertY: false,
-      muted: false,
-    },
-    ultra: {
-      quality: "ultra",
-      renderScale: 1,
-      maxDpr: 2,
-      targetFps: 120,
-      autoResolution: false,
-      shadows: true,
-      effects: 1,
-      asteroidCount: 560,
-      starCount: 6000,
-      sensitivity: 1,
-      invertY: false,
-      muted: false,
-    },
-  };
+const QUALITY_PRESETS: Record<
+  Exclude<QualityName, "custom">,
+  GraphicsSettings
+> = {
+  low: {
+    quality: "low",
+    renderScale: 0.65,
+    maxDpr: 1,
+    targetFps: 60,
+    autoResolution: true,
+    shadows: false,
+    effects: 0.45,
+    asteroidCount: 130,
+    starCount: 1400,
+    sensitivity: 1,
+    invertY: false,
+    muted: false,
+  },
+  medium: {
+    quality: "medium",
+    renderScale: 0.82,
+    maxDpr: 1.25,
+    targetFps: 60,
+    autoResolution: true,
+    shadows: false,
+    effects: 0.7,
+    asteroidCount: 240,
+    starCount: 2600,
+    sensitivity: 1,
+    invertY: false,
+    muted: false,
+  },
+  high: {
+    quality: "high",
+    renderScale: 1,
+    maxDpr: 1.5,
+    targetFps: 60,
+    autoResolution: true,
+    shadows: true,
+    effects: 0.9,
+    asteroidCount: 380,
+    starCount: 4200,
+    sensitivity: 1,
+    invertY: false,
+    muted: false,
+  },
+  ultra: {
+    quality: "ultra",
+    renderScale: 1,
+    maxDpr: 2,
+    targetFps: 120,
+    autoResolution: false,
+    shadows: true,
+    effects: 1,
+    asteroidCount: 560,
+    starCount: 6000,
+    sensitivity: 1,
+    invertY: false,
+    muted: false,
+  },
+};
 
 const DEFAULT_SETTINGS = QUALITY_PRESETS.ultra;
 const SETTINGS_KEY = "rogue-vector-settings-v2";
 const SCORE_KEY = "rogue-vector-high-score";
 const FIXED_STEP = 1 / 60;
 const NO_FLIGHT_INPUT: FlightInput = { fire: false, boost: false };
-const MAX_ENEMIES = 20;
+const MAX_ENEMIES = 34;
 const MAX_PROJECTILES = 320;
 const MAX_EXPLOSIONS = 32;
 const MUZZLE_FLASH_SIZE = 7;
@@ -254,25 +261,15 @@ const MUZZLE_FLASH_SECONDS = 0.05;
 const LOCAL_FORWARD = new THREE.Vector3(0, 0, -1);
 /** Roll axis, pointing back down the fuselage: +Z rolls the left wing down. */
 const LOCAL_ROLL_AXIS = new THREE.Vector3(0, 0, 1);
-const REFERENCE_SPEED_SCALE = 17.5;
-const MAX_PITCH_RATE = THREE.MathUtils.degToRad(78);
-const MAX_YAW_RATE = THREE.MathUtils.degToRad(92);
-const FLIGHT_CONTROL_RESPONSE = 7;
 // How far the ship lays over at full stick or mouse deflection. A phone
 // needs no such scale: the ship copies the phone's own roll, angle for angle.
 // The bank is a visual answer to the input, not an aerodynamic one: it rolls
 // the model inside the flight frame rather than rolling the frame itself, so
 // a banked ship still pitches and yaws along the axes the player aimed it at.
-const MAX_BANK_ROLL = THREE.MathUtils.degToRad(55);
-const BANK_ROLL_RESPONSE = 5;
 const ARENA_HALF_EXTENT = 700;
 // The afterburner reservoir holds ten seconds of thrust. It only refills while
 // the burner is off, so a single hold can never exceed BOOST_MAX_SECONDS.
 const BOOST_MAX_SECONDS = 10;
-const BOOST_RECHARGE_PER_SECOND = 0.5;
-const BOOST_REARM_SECONDS = BOOST_MAX_SECONDS * 0.25;
-const BOOST_SPEED_FACTOR = 2.2;
-const BOOST_RESPONSE = 4.5;
 const BOOST_FOV_KICK = 14;
 const BOOST_CHASE_PULLBACK = 16;
 const PLAYER_XWING_VISUAL_SCALE = 5;
@@ -324,8 +321,6 @@ const BOLT_CONVERGENCE_MIN_COS = Math.cos(THREE.MathUtils.degToRad(25));
 const AIM_ASSIST_COS = Math.cos(THREE.MathUtils.degToRad(3));
 const PLAYER_HIT_RADIUS = 3.4;
 // Scales on enemy cruise speed and on how hard they turn and weave.
-const ENEMY_SPEED_SCALE = 0.65;
-const ENEMY_AGILITY_SCALE = 0.75;
 // The asteroid field repeats with the period the arena wraps at, so wrapping
 // shows exactly the view the ship left. Copies of it are drawn out to the
 // view distance and fade into the background well before they reach it.
@@ -471,7 +466,9 @@ function deadzone(value: number, zone = 0.12) {
   return Math.sign(value) * ((abs - zone) / (1 - zone));
 }
 
-async function loadShipModelLibrary(isTouchDevice: boolean): Promise<ShipModelLibrary> {
+async function loadShipModelLibrary(
+  isTouchDevice: boolean,
+): Promise<ShipModelLibrary> {
   const loader = new GLTFLoader();
   const loadUncached = async (path: string, role: ShipRole) => {
     const gltf = await loader.loadAsync(path);
@@ -482,7 +479,10 @@ async function loadShipModelLibrary(isTouchDevice: boolean): Promise<ShipModelLi
         object.castShadow = true;
         object.receiveShadow = true;
         object.frustumCulled = true;
-      } else if (object instanceof THREE.Camera || object instanceof THREE.Light) {
+      } else if (
+        object instanceof THREE.Camera ||
+        object instanceof THREE.Light
+      ) {
         nonVisualNodes.push(object);
       }
     });
@@ -538,13 +538,31 @@ async function loadShipModelLibrary(isTouchDevice: boolean): Promise<ShipModelLi
     bomberLow,
     asteroidScene,
   ] = await Promise.all([
-    load(isTouchDevice ? "/models/xwing-low.glb" : "/models/xwing-high.glb", "player"),
+    load(
+      isTouchDevice ? "/models/xwing-low.glb" : "/models/xwing-high.glb",
+      "player",
+    ),
     load("/models/xwing-low.glb", "player"),
-    load(isTouchDevice ? "/models/tie-fighter-low.glb" : "/models/tie-fighter-high.glb", "fighter"),
+    load(
+      isTouchDevice
+        ? "/models/tie-fighter-low.glb"
+        : "/models/tie-fighter-high.glb",
+      "fighter",
+    ),
     load("/models/tie-fighter-low.glb", "fighter"),
-    load(isTouchDevice ? "/models/tie-interceptor-low.glb" : "/models/tie-interceptor-high.glb", "interceptor"),
+    load(
+      isTouchDevice
+        ? "/models/tie-interceptor-low.glb"
+        : "/models/tie-interceptor-high.glb",
+      "interceptor",
+    ),
     load("/models/tie-interceptor-low.glb", "interceptor"),
-    load(isTouchDevice ? "/models/stealth-bomber-low.glb" : "/models/stealth-bomber-high.glb", "bomber"),
+    load(
+      isTouchDevice
+        ? "/models/stealth-bomber-low.glb"
+        : "/models/stealth-bomber-high.glb",
+      "bomber",
+    ),
     load("/models/stealth-bomber-low.glb", "bomber"),
     loader.loadAsync("/models/asteroid-high.glb").then((gltf) => gltf.scene),
   ]);
@@ -1043,14 +1061,6 @@ type FlightInput = {
   brake?: boolean;
 };
 
-type ActiveManeuver = {
-  kind: ManeuverKind;
-  direction: -1 | 1;
-  elapsed: number;
-  /** The pose reached so far, to take each step's change from. */
-  pose: ManeuverPose;
-};
-
 type Projectile = {
   active: boolean;
   friendly: boolean;
@@ -1076,11 +1086,15 @@ type Asteroid = {
 
 /** Shortest offset between two coordinates in the repeating asteroid field. */
 function wrapFieldOffset(offset: number) {
-  return offset - ASTEROID_FIELD_PERIOD * Math.round(offset / ASTEROID_FIELD_PERIOD);
+  return (
+    offset - ASTEROID_FIELD_PERIOD * Math.round(offset / ASTEROID_FIELD_PERIOD)
+  );
 }
 
 function wrapGridCell(cell: number) {
-  return ((cell % ASTEROID_GRID_CELLS) + ASTEROID_GRID_CELLS) % ASTEROID_GRID_CELLS;
+  return (
+    ((cell % ASTEROID_GRID_CELLS) + ASTEROID_GRID_CELLS) % ASTEROID_GRID_CELLS
+  );
 }
 
 /**
@@ -1199,7 +1213,10 @@ class SynthAudio {
     oscillator.type = enemy ? "square" : "sawtooth";
     const now = this.context.currentTime;
     oscillator.frequency.setValueAtTime(enemy ? 240 : 760, now);
-    oscillator.frequency.exponentialRampToValueAtTime(enemy ? 110 : 240, now + 0.1);
+    oscillator.frequency.exponentialRampToValueAtTime(
+      enemy ? 110 : 240,
+      now + 0.1,
+    );
     gain.gain.setValueAtTime(enemy ? 0.035 : 0.055, now);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
     oscillator.connect(gain);
@@ -1298,8 +1315,13 @@ type GameCallbacks = {
   onHighScore: (score: number) => void;
 };
 
-class DogfightEngine {
+class DogfightEngine extends FlightDynamics {
   readonly supported = true;
+  coop: CoopClient | null = null;
+  private soloAsteroids: Asteroid[] | null = null;
+  private teammates = new Map<string, THREE.Group>();
+  private lastCoopTick = -1;
+
   private readonly canvas: HTMLCanvasElement;
   private readonly callbacks: GameCallbacks;
   private readonly modelLibrary: ShipModelLibrary;
@@ -1309,12 +1331,12 @@ class DogfightEngine {
   private readonly audio = new SynthAudio();
   private readonly renderer: THREE.WebGLRenderer;
   private resizeObserver?: ResizeObserver;
-  private player!: THREE.Group;
+  declare player: THREE.Group;
   /** The visible ship, banked inside the flight frame. */
-  private playerModel!: THREE.Group;
-  private bankRoll = 0;
+  declare playerModel: THREE.Group;
+
   /** The phone's roll from its calibrated neutral, as the bank that copies it. */
-  private phoneBankRoll = 0;
+
   private cockpit!: THREE.Group;
   private sun!: THREE.DirectionalLight;
   private sunDisc!: THREE.Sprite;
@@ -1328,7 +1350,10 @@ class DogfightEngine {
   private asteroids: Asteroid[] = [];
   private asteroidGrid = new Map<string, number[]>();
   private activeAsteroidCount = 0;
-  private readonly nearestAsteroid = { position: new THREE.Vector3(), radius: 0 };
+  private readonly nearestAsteroid = {
+    position: new THREE.Vector3(),
+    radius: 0,
+  };
   private readonly asteroidFrustum = new THREE.Frustum();
   private readonly asteroidSphere = new THREE.Sphere();
   private settings: GraphicsSettings;
@@ -1336,8 +1361,7 @@ class DogfightEngine {
   private status: GameStatus = "menu";
   private cameraMode: "CHASE" | "COCKPIT" = "CHASE";
   private keys = new Set<string>();
-  private mouseXPercent = 0;
-  private mouseYPercent = 0;
+
   private mouseFire = false;
   private muzzleFlashes: Array<{ sprite: THREE.Sprite; life: number }> = [];
   /**
@@ -1363,39 +1387,16 @@ class DogfightEngine {
   private gyroFilteredY = 0;
   private wakeLock?: WakeLockHandle;
   private isTouchDevice = false;
-  private sideways = false;
-  private sidewaysRotation = 0;
-  private sidewaysStartRotation = 0;
-  private sidewaysTargetRotation = 0;
-  private sidewaysTween = 1;
-  private speedMultiplier = 4;
-  private speed = 70;
-  private boostRemaining = BOOST_MAX_SECONDS;
-  private boostActive = false;
-  private boostLocked = false;
-  private boostBlend = 0;
-  private brakeActive = false;
-  private brakeBlend = 0;
-  private maneuver: ActiveManeuver | null = null;
-  private pendingManeuver: {
-    kind: ManeuverKind;
-    direction: -1 | 1;
-  } | null = null;
-  private readonly maneuverStep: ManeuverPose = {
-    pitch: 0,
-    roll: 0,
-    lateral: 0,
-  };
+
   /** The barrel roll's spin of the model, on top of the bank. */
-  private maneuverRoll = 0;
-  private barrelRollCooldown = 0;
+
   private deflections = 0;
   private lastArrowTap = { ArrowLeft: -10, ArrowRight: -10 };
   private lastUturnChord = false;
   private lastGamepadRoll = { left: false, right: false };
   private lastGamepadSomersault = false;
   private muzzleIndex = 0;
-  private readonly angularVelocity = new THREE.Vector3();
+
   private shields = 100;
   private hull = 100;
   private lastDamageTime = -20;
@@ -1417,20 +1418,18 @@ class DogfightEngine {
   private diagnostics = false;
   private lastGamepadCamera = false;
   private lastGamepadSideways = false;
-  private activeInput: HudSnapshot["input"] = "KEYBOARD + MOUSE";
+
   private disposed = false;
   private damageFlash = 0;
   private idleAngle = 0;
   private simulationTick = 0;
 
-  private readonly tempV1 = new THREE.Vector3();
   private readonly tempV2 = new THREE.Vector3();
   private readonly tempV3 = new THREE.Vector3();
   private readonly tempV4 = new THREE.Vector3();
   private readonly tempV5 = new THREE.Vector3();
   private readonly tempV6 = new THREE.Vector3();
-  private readonly tempQ1 = new THREE.Quaternion();
-  private readonly tempEuler = new THREE.Euler();
+
   private readonly tempMatrix = new THREE.Matrix4();
   private readonly tempObject = new THREE.Object3D();
   private readonly tempScale = new THREE.Vector3();
@@ -1444,6 +1443,11 @@ class DogfightEngine {
     modelLibrary: ShipModelLibrary,
     callbacks: GameCallbacks,
   ) {
+    super();
+    this.onFlightSound = (sound) =>
+      sound === "denied"
+        ? this.audio.denied()
+        : this.audio.whoosh(sound === "maneuver");
     this.renderer = renderer;
     this.canvas = renderer.domElement;
     this.scene = scene;
@@ -1473,7 +1477,6 @@ class DogfightEngine {
   }
 
   private attachQaControls() {
-    if (!new URLSearchParams(window.location.search).has("qa")) return;
     window.__rogueVectorQa = {
       stageFleet: () => this.stageFleetInspection(),
       simulateGyro: (beta, gamma) => {
@@ -1614,7 +1617,13 @@ class DogfightEngine {
     };
     window.__gameTest = {
       ready: true,
-      getState: window.__rogueVectorQa.snapshot,
+      disconnect: new URLSearchParams(window.location.search).has("qa")
+        ? () => this.coop?.disconnectForTest()
+        : undefined,
+      getState: () => ({
+        ...window.__rogueVectorQa!.snapshot(),
+        multiplayer: this.coop?.view ?? null,
+      }),
     };
   }
 
@@ -1850,7 +1859,8 @@ class DogfightEngine {
             sphere.radius = asteroid.radius * 1.1;
             if (
               distanceSq >
-                ASTEROID_SHADOW_CASTER_DISTANCE * ASTEROID_SHADOW_CASTER_DISTANCE &&
+                ASTEROID_SHADOW_CASTER_DISTANCE *
+                  ASTEROID_SHADOW_CASTER_DISTANCE &&
               !this.asteroidFrustum.intersectsSphere(sphere)
             ) {
               continue;
@@ -1895,7 +1905,7 @@ class DogfightEngine {
         id += 1;
       }
     };
-    add("fighter", 10);
+    add("fighter", 24);
     add("interceptor", 7);
     add("bomber", 5);
   }
@@ -2005,7 +2015,10 @@ class DogfightEngine {
     window.addEventListener("mousemove", this.onMouseMove);
     window.addEventListener("mouseup", this.onCanvasMouseUp);
     window.addEventListener("deviceorientation", this.onDeviceOrientation);
-    window.addEventListener("orientationchange", this.onScreenOrientationChange);
+    window.addEventListener(
+      "orientationchange",
+      this.onScreenOrientationChange,
+    );
     window.addEventListener("touchstart", this.onTouchStart, { passive: true });
     window.addEventListener("touchmove", this.onTouchMove, { passive: true });
     window.addEventListener("touchend", this.onTouchEnd);
@@ -2024,7 +2037,7 @@ class DogfightEngine {
     if (this.status !== "playing") return;
 
     const screenAngle =
-      ((window.screen?.orientation?.angle ?? 0) % 360 + 360) % 360;
+      (((window.screen?.orientation?.angle ?? 0) % 360) + 360) % 360;
     // A baseline captured in one screen orientation is meaningless in another.
     if (this.gyroScreenAngle !== screenAngle) {
       this.gyroScreenAngle = screenAngle;
@@ -2080,8 +2093,9 @@ class DogfightEngine {
     if (this.status === "playing" && this.gyroPermission === "prompt") {
       this.requestGyroPermission();
     }
-    this.touchSteeringActive =
-      !(event.target instanceof Element && event.target.closest(".touch-btn"));
+    this.touchSteeringActive = !(
+      event.target instanceof Element && event.target.closest(".touch-btn")
+    );
   };
 
   private onTouchMove = (event: TouchEvent) => {
@@ -2132,9 +2146,10 @@ class DogfightEngine {
   public async requestGyroPermission(): Promise<boolean> {
     if (this.gyroPermission === "granted") return true;
     if (this.gyroPermissionRequest) return this.gyroPermissionRequest;
-    const requestPermissionCandidate: unknown =
-      Object.getOwnPropertyDescriptor(DeviceOrientationEvent, "requestPermission")
-        ?.value;
+    const requestPermissionCandidate: unknown = Object.getOwnPropertyDescriptor(
+      DeviceOrientationEvent,
+      "requestPermission",
+    )?.value;
     if (!isMotionPermissionRequest(requestPermissionCandidate)) {
       this.gyroPermission = "granted";
       this.calibrateGyro();
@@ -2299,17 +2314,22 @@ class DogfightEngine {
       settings.renderScale,
     );
     if (this.asteroidMesh) {
-      this.activeAsteroidCount = Math.min(
-        settings.asteroidCount,
-        this.isTouchDevice ? 320 : settings.asteroidCount,
-        this.asteroids.length,
-      );
+      this.activeAsteroidCount = this.coop
+        ? 130
+        : Math.min(
+            settings.asteroidCount,
+            this.isTouchDevice ? 320 : settings.asteroidCount,
+            this.asteroids.length,
+          );
       this.asteroidMesh.castShadow = settings.shadows && !this.isTouchDevice;
       this.rebuildAsteroidGrid();
     }
     this.stars?.geometry.setDrawRange(
       0,
-      Math.min(settings.starCount, this.isTouchDevice ? 3500 : settings.starCount),
+      Math.min(
+        settings.starCount,
+        this.isTouchDevice ? 3500 : settings.starCount,
+      ),
     );
     if (this.renderer) {
       this.renderer.shadowMap.enabled = settings.shadows && !this.isTouchDevice;
@@ -2321,7 +2341,10 @@ class DogfightEngine {
 
   private updateRendererResolution(
     width = Math.max(1, Math.round(this.canvas.getBoundingClientRect().width)),
-    height = Math.max(1, Math.round(this.canvas.getBoundingClientRect().height)),
+    height = Math.max(
+      1,
+      Math.round(this.canvas.getBoundingClientRect().height),
+    ),
   ) {
     if (!this.renderer) return;
     const dpr = Math.min(
@@ -2339,7 +2362,188 @@ class DogfightEngine {
     }
   }
 
+  startCoop(client: CoopClient) {
+    this.resetGame();
+    this.clearActiveEntities();
+    this.coop = client;
+    this.soloAsteroids = this.asteroids;
+    this.asteroids = collisionMap(client.view.state!.seed).map((a) => ({
+      position: new THREE.Vector3(...a.position),
+      radius: a.radius,
+      matrix: new THREE.Matrix4().compose(
+        new THREE.Vector3(...a.position),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(...a.rotation)),
+        new THREE.Vector3(...a.scale),
+      ),
+    }));
+    this.activeAsteroidCount = 130;
+    this.rebuildAsteroidGrid();
+    this.lastCoopTick = -1;
+    this.audio.ensure();
+    this.audio.setMuted(this.settings.muted);
+    this.setStatus("playing");
+  }
+
+  private leaveCoop() {
+    this.coop?.leave();
+    this.coop = null;
+    if (this.soloAsteroids) {
+      this.asteroids = this.soloAsteroids;
+      this.soloAsteroids = null;
+    }
+    for (const group of this.teammates.values()) {
+      group.traverse((child) => {
+        if (child instanceof THREE.Sprite) {
+          child.material.map?.dispose();
+          child.material.dispose();
+        }
+      });
+      this.scene.remove(group);
+    }
+    this.teammates.clear();
+    this.activeAsteroidCount = this.settings.asteroidCount;
+    this.rebuildAsteroidGrid();
+  }
+
+  private updateCoop(delta: number) {
+    const client = this.coop!;
+    const input =
+      this.status === "playing"
+        ? this.readInput(delta)
+        : { fire: false, boost: false, brake: false };
+    client.update(
+      delta,
+      this.status === "playing"
+        ? {
+            ...neutralControls(),
+            ...input,
+            x: this.mouseXPercent,
+            y: this.mouseYPercent,
+            sideways: this.sideways,
+            maneuver: this.pendingManeuver?.kind ?? null,
+            direction: this.pendingManeuver?.direction ?? 1,
+          }
+        : neutralControls(),
+    );
+    this.pendingManeuver = null;
+    const state = client.view.state;
+    if (!state) return;
+    const local = state.pilots.find((p) => p.id === client.view.pilot);
+    if (!local) return;
+    const before = this.player.position.clone();
+    this.player.position.copy(client.flight.player.position);
+    this.player.quaternion.copy(client.flight.player.quaternion);
+    for (const axis of ["x", "y", "z"] as const)
+      if (Math.abs(this.player.position[axis] - before[axis]) > 700)
+        this.camera.position[axis] += this.player.position[axis] - before[axis];
+    this.playerModel.rotation.z =
+      client.flight.bankRoll + client.flight.maneuverRoll;
+    this.speed = client.flight.speed;
+    this.boostRemaining = client.flight.boostRemaining;
+    this.boostBlend = client.flight.boostBlend;
+    this.boostActive = client.flight.boostActive;
+    this.brakeActive = client.flight.brakeActive;
+    this.maneuver = client.flight.maneuver;
+    this.shields = local.shields;
+    this.hull = local.hull;
+    this.wave = state.wave;
+    this.score = state.score;
+    this.player.visible = local.hull > 0 && this.cameraMode === "CHASE";
+    this.cockpit.visible = local.hull > 0 && this.cameraMode === "COCKPIT";
+    const alpha = Math.min(1, (performance.now() - client.receivedAt) / 50);
+    const near = (p: number[], old?: number[]) => {
+      const v = new THREE.Vector3().fromArray(old ?? p);
+      v.addScaledVector(offset(v, new THREE.Vector3().fromArray(p)), alpha);
+      return offset(this.player.position, v).add(this.player.position);
+    };
+    const quaternion = (q: number[], old?: number[]) =>
+      new THREE.Quaternion()
+        .fromArray(old ?? q)
+        .slerp(new THREE.Quaternion().fromArray(q), alpha);
+    const seen = new Set<string>();
+    for (const p of state.pilots) {
+      if (p.id === local.id) continue;
+      seen.add(p.id);
+      let group = this.teammates.get(p.id);
+      if (!group) {
+        group = this.modelLibrary[this.modelDetail].player.clone(true);
+        const label = document.createElement("canvas");
+        label.width = 512;
+        label.height = 64;
+        const ctx = label.getContext("2d")!;
+        ctx.fillStyle = "#72ffe1";
+        ctx.font = "28px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(`◇ ${p.callsign}`, 256, 42);
+        const sprite = new THREE.Sprite(
+          new THREE.SpriteMaterial({
+            map: new THREE.CanvasTexture(label),
+            depthTest: false,
+            transparent: true,
+          }),
+        );
+        sprite.scale.set(32, 4, 1);
+        sprite.position.y = 10;
+        group.add(sprite);
+        this.scene.add(group);
+        this.teammates.set(p.id, group);
+      }
+      const old = client.previous?.pilots.find((x) => x.id === p.id);
+      group.visible = p.hull > 0;
+      group.position.copy(near(p.flight.p, old?.flight.p));
+      group.quaternion.copy(quaternion(p.flight.q, old?.flight.q));
+    }
+    for (const [id, group] of this.teammates) {
+      if (!seen.has(id)) {
+        group.traverse(child => { if (child instanceof THREE.Sprite) { child.material.map?.dispose(); child.material.dispose(); } });
+        this.scene.remove(group); this.teammates.delete(id);
+      }
+    }
+    this.enemies.forEach((e) => {
+      e.active = false;
+      e.group.visible = false;
+    });
+    for (const e of state.enemies) {
+      const render = this.enemies.find((x) => !x.active && x.kind === e.kind);
+      if (!render) continue;
+      const old = client.previous?.enemies.find((x) => x.id === e.id);
+      render.active = true;
+      render.id = e.id;
+      render.health = e.health;
+      render.maxHealth = Math.max(e.health, 42);
+      render.speed = e.speed;
+      render.group.visible = true;
+      render.group.position.copy(near(e.p, old?.p));
+      render.group.quaternion.copy(quaternion(e.q, old?.q));
+    }
+    this.projectiles.forEach((p) => {
+      p.active = false;
+    });
+    state.bolts.forEach((b, i) => {
+      const p = this.projectiles[i];
+      if (!p) return;
+      p.active = true;
+      p.friendly = b.owner !== null;
+      p.position.copy(
+        near(b.p, client.previous?.bolts.find((x) => x.id === b.id)?.p),
+      );
+      p.velocity.fromArray(b.v);
+      p.damage = b.damage;
+    });
+    if (this.lastCoopTick !== state.tick) {
+      const prior = client.previous;
+      if (prior)
+        for (const e of prior.enemies)
+          if (!state.enemies.some((x) => x.id === e.id))
+            this.spawnExplosion(near(e.p), 12);
+      this.lastCoopTick = state.tick;
+    }
+    this.audio.setEngine(this.speed, this.boostActive);
+    this.updateCamera(delta);
+  }
+
   begin() {
+    if (this.coop) this.leaveCoop();
     this.resetFlightInput();
     this.resetGame();
     this.audio.ensure();
@@ -2401,6 +2605,7 @@ class DogfightEngine {
   }
 
   showMenu() {
+    if (this.coop) this.leaveCoop();
     this.clearActiveEntities();
     this.player.position.set(0, 0, 0);
     this.player.quaternion.identity();
@@ -2477,11 +2682,10 @@ class DogfightEngine {
   }
 
   private spawnWave() {
-    const desiredFighters = Math.min(2 + Math.ceil(this.wave * 0.75), 8);
-    const desiredInterceptors =
-      this.wave >= 2 ? Math.min(1 + Math.floor(this.wave / 2), 6) : 0;
-    const desiredBombers =
-      this.wave >= 3 ? Math.min(Math.floor(this.wave / 3), 4) : 0;
+    const composition = waveComposition(this.wave);
+    const desiredFighters = composition.fighter,
+      desiredInterceptors = composition.interceptor,
+      desiredBombers = composition.bomber;
     const desiredTotal = Math.min(
       desiredFighters + desiredInterceptors + desiredBombers,
       MAX_ENEMIES,
@@ -2503,20 +2707,10 @@ class DogfightEngine {
   }
 
   private activateEnemy(enemy: Enemy) {
-    const healthByKind = {
-      fighter: 40 + this.wave * 1.5,
-      interceptor: 28 + this.wave,
-      bomber: 132 + this.wave * 4,
-    };
-    const speedByKind = {
-      fighter: (67 + Math.min(this.wave, 8) * 1.4) * ENEMY_SPEED_SCALE,
-      interceptor: (94 + Math.min(this.wave, 8) * 1.7) * ENEMY_SPEED_SCALE,
-      bomber: (49 + Math.min(this.wave, 8)) * ENEMY_SPEED_SCALE,
-    };
+    const stats = enemyStats(enemy.kind, this.wave);
     enemy.active = true;
-    enemy.health = healthByKind[enemy.kind];
-    enemy.maxHealth = enemy.health;
-    enemy.speed = speedByKind[enemy.kind];
+    enemy.health = enemy.maxHealth = stats.health;
+    enemy.speed = stats.speed;
     enemy.cooldown = 0.6 + Math.random();
     enemy.burst = 0;
     enemy.group.visible = true;
@@ -2532,8 +2726,13 @@ class DogfightEngine {
         this.player.position.z + radius * Math.sin(phi) * Math.sin(theta),
       );
       attempts += 1;
-    } while (this.positionHitsAsteroid(enemy.group.position, 18) && attempts < 12);
-    this.tempV1.subVectors(this.player.position, enemy.group.position).normalize();
+    } while (
+      this.positionHitsAsteroid(enemy.group.position, 18) &&
+      attempts < 12
+    );
+    this.tempV1
+      .subVectors(this.player.position, enemy.group.position)
+      .normalize();
     enemy.group.quaternion.setFromUnitVectors(LOCAL_FORWARD, this.tempV1);
   }
 
@@ -2559,7 +2758,10 @@ class DogfightEngine {
     if (this.disposed) return;
     const delta = Math.min(0.05, Math.max(0, frameDelta));
 
-    if (this.status === "playing") {
+    if (this.coop) {
+      this.updateCoop(delta);
+      this.updateAdaptiveResolution(delta);
+    } else if (this.status === "playing") {
       this.fixedUpdate(delta);
       this.updateExhausts();
       this.updateCamera(delta);
@@ -2721,225 +2923,13 @@ class DogfightEngine {
     return { fire, boost, brake };
   }
 
-  // Boost and brake both burn the afterburner reservoir: the brake is the
-  // burner fired against the direction of travel. Holding both at once is the
-  // U-turn chord, so it fires neither.
-  private updateThrottle(delta: number, boostHeld: boolean, brakeHeld: boolean) {
-    const held = boostHeld !== brakeHeld;
-    if (held && !this.boostLocked && this.boostRemaining > 0) {
-      this.boostActive = boostHeld;
-      this.brakeActive = brakeHeld;
-      this.boostRemaining = Math.max(0, this.boostRemaining - delta);
-      // Draining to empty locks the burner out until the reservoir has
-      // recovered, so the pilot cannot chain two full-length burns.
-      if (this.boostRemaining === 0) {
-        this.boostActive = false;
-        this.brakeActive = false;
-        this.boostLocked = true;
-      }
-    } else {
-      this.boostActive = false;
-      this.brakeActive = false;
-      this.boostRemaining = Math.min(
-        BOOST_MAX_SECONDS,
-        this.boostRemaining + delta * BOOST_RECHARGE_PER_SECOND,
-      );
-      if (this.boostLocked && this.boostRemaining >= BOOST_REARM_SECONDS) {
-        this.boostLocked = false;
-      }
-    }
-
-    this.boostBlend = THREE.MathUtils.damp(
-      this.boostBlend,
-      this.boostActive ? 1 : 0,
-      BOOST_RESPONSE,
-      delta,
-    );
-    this.brakeBlend = THREE.MathUtils.damp(
-      this.brakeBlend,
-      this.brakeActive ? 1 : 0,
-      BOOST_RESPONSE,
-      delta,
-    );
-  }
-
-  /**
-   * Starts a maneuver if the ship is free to fly one and the reservoir can
-   * pay for it. Returns whether it started.
-   */
-  private startManeuver(kind: ManeuverKind, direction: -1 | 1 = 1) {
-    if (this.maneuver) return false;
-    if (kind === "barrelRoll" && this.barrelRollCooldown > 0) return false;
-    const cost = MANEUVER_METER_COST[kind];
-    if (cost > 0 && (this.boostLocked || this.boostRemaining < cost)) {
-      this.audio.denied();
-      return false;
-    }
-    this.boostRemaining -= cost;
-    if (cost > 0 && this.boostRemaining <= 0) {
-      this.boostRemaining = 0;
-      this.boostLocked = true;
-    }
-    if (kind === "barrelRoll") this.barrelRollCooldown = BARREL_ROLL_COOLDOWN;
-    this.maneuver = {
-      kind,
-      direction,
-      elapsed: 0,
-      pose: maneuverPose(kind, 0),
-    };
-    this.audio.whoosh(kind !== "barrelRoll");
-    return true;
-  }
-
-  /** True while a somersault or U-turn has taken the stick away. */
-  private scriptedManeuverActive() {
-    return this.maneuver !== null && this.maneuver.kind !== "barrelRoll";
-  }
-
-  private barrelRolling() {
-    return this.maneuver?.kind === "barrelRoll";
-  }
-
-  /**
-   * Advances the active maneuver and returns how far it moved this step:
-   * pitch and roll for the flight frame, and the sideways jink.
-   */
-  private advanceManeuver(delta: number) {
-    const step = this.maneuverStep;
-    step.pitch = 0;
-    step.roll = 0;
-    step.lateral = 0;
-    if (!this.maneuver) return step;
-    const maneuver = this.maneuver;
-    maneuver.elapsed += delta;
-    const t = Math.min(1, maneuver.elapsed / MANEUVER_DURATION[maneuver.kind]);
-    const pose = maneuverPose(maneuver.kind, t);
-    step.pitch = pose.pitch - maneuver.pose.pitch;
-    step.roll = (pose.roll - maneuver.pose.roll) * maneuver.direction;
-    step.lateral = (pose.lateral - maneuver.pose.lateral) * maneuver.direction;
-    maneuver.pose = pose;
-    if (t >= 1) this.maneuver = null;
-    return step;
-  }
-
   private updatePlayer(delta: number, input: FlightInput) {
-    this.speedMultiplier = Math.min(9, this.speedMultiplier + 0.001);
-    this.barrelRollCooldown = Math.max(0, this.barrelRollCooldown - delta);
-    if (this.pendingManeuver) {
-      this.startManeuver(
-        this.pendingManeuver.kind,
-        this.pendingManeuver.direction,
-      );
-      this.pendingManeuver = null;
-    }
-    const scripted = this.scriptedManeuverActive();
-    // A loop or U-turn flies at whatever throttle it started with.
-    this.updateThrottle(
-      delta,
-      !scripted && input.boost,
-      !scripted && Boolean(input.brake),
-    );
-    this.speed =
-      this.speedMultiplier *
-      REFERENCE_SPEED_SCALE *
-      (1 + this.boostBlend * (BOOST_SPEED_FACTOR - 1)) *
-      THREE.MathUtils.lerp(1, BRAKE_SPEED_FACTOR, this.brakeBlend);
-    const turnFactor = THREE.MathUtils.lerp(
-      1,
-      BRAKE_TURN_FACTOR,
-      this.brakeBlend,
-    );
-
-    const previousProfileRotation = this.sidewaysRotation;
-    if (this.sidewaysTween < 1) {
-      this.sidewaysTween = Math.min(1, this.sidewaysTween + delta / 0.8);
-      const exponentialOut =
-        this.sidewaysTween >= 1
-          ? 1
-          : 1 - Math.pow(2, -10 * this.sidewaysTween);
-      this.sidewaysRotation = THREE.MathUtils.lerp(
-        this.sidewaysStartRotation,
-        this.sidewaysTargetRotation,
-        exponentialOut,
-      );
-    }
-
-    // A loop or U-turn takes the stick away, and the turn rates settle to
-    // nothing so control comes back smoothly when the maneuver ends.
-    const targetPitchRate = scripted
-      ? 0
-      : -this.mouseYPercent * MAX_PITCH_RATE * turnFactor;
-    const targetYawRate = scripted
-      ? 0
-      : -this.mouseXPercent * MAX_YAW_RATE * turnFactor;
-    this.angularVelocity.x = THREE.MathUtils.damp(
-      this.angularVelocity.x,
-      targetPitchRate,
-      FLIGHT_CONTROL_RESPONSE,
-      delta,
-    );
-    this.angularVelocity.y = THREE.MathUtils.damp(
-      this.angularVelocity.y,
-      targetYawRate,
-      FLIGHT_CONTROL_RESPONSE,
-      delta,
-    );
-
-    // Lay the ship over into the turn. On a phone it copies the phone's roll
-    // exactly; that reading is already smoothed, and damping it again would
-    // leave the ship trailing the hand. Other inputs bank in proportion to
-    // the steering. Rotating the model rather than the flight frame keeps it
-    // decorative: holding a turn never bends the climb input into a turn.
-    this.bankRoll =
-      this.activeInput === "PHONE / GYRO"
-        ? this.phoneBankRoll
-        : THREE.MathUtils.damp(
-            this.bankRoll,
-            -this.mouseXPercent * MAX_BANK_ROLL,
-            BANK_ROLL_RESPONSE,
-            delta,
-          );
-    const rolling = this.barrelRolling();
-    const maneuverStep = this.advanceManeuver(delta);
-    // A barrel roll spins the model, not the flight frame, like the bank: the
-    // ship keeps flying where it was aimed while it rolls. Rolling right is a
-    // negative turn about the roll axis, as the bank is.
-    if (rolling && this.maneuver) {
-      this.maneuverRoll -= maneuverStep.roll;
-    } else {
-      this.maneuverRoll = 0;
-    }
-    this.playerModel.rotation.z = this.bankRoll + this.maneuverRoll;
-
-    this.tempEuler.set(
-      this.angularVelocity.x * delta + maneuverStep.pitch,
-      this.angularVelocity.y * delta,
-      this.sidewaysRotation -
-        previousProfileRotation +
-        (rolling ? 0 : maneuverStep.roll),
-      "XYZ",
-    );
-    this.tempQ1.setFromEuler(this.tempEuler);
-    this.player.quaternion.multiply(this.tempQ1).normalize();
-
-    if (maneuverStep.lateral !== 0) {
-      this.player.position.addScaledVector(
-        this.tempV1.set(1, 0, 0).applyQuaternion(this.player.quaternion),
-        maneuverStep.lateral,
-      );
-    }
-
-    const playerForward = this.tempV1
-      .copy(LOCAL_FORWARD)
-      .applyQuaternion(this.player.quaternion);
-    this.player.position.addScaledVector(playerForward, this.speed * delta);
+    this.advanceFlight(delta, input);
     this.audio.setEngine(this.speed, this.boostActive);
-
     if (input.fire && this.fireCooldown <= 0) {
       this.firePlayerLaser();
       this.fireCooldown = 0.115;
     }
-
     this.wrapFlightArena();
     this.checkPlayerAsteroidCollision();
   }
@@ -3037,7 +3027,13 @@ class DogfightEngine {
       .copy(LOCAL_FORWARD)
       .applyQuaternion(enemy.group.quaternion)
       .multiplyScalar(enemy.speed);
-    return leadTargetPoint(shooter, enemy.group.position, velocity, boltSpeed, out);
+    return leadTargetPoint(
+      shooter,
+      enemy.group.position,
+      velocity,
+      boltSpeed,
+      out,
+    );
   }
 
   private updateEnemies(delta: number) {
@@ -3051,41 +3047,27 @@ class DogfightEngine {
       const distance = toPlayer.length();
       toPlayer.multiplyScalar(1 / Math.max(distance, 0.001));
 
-      const desired = this.tempV2.copy(toPlayer);
-      const weaveStrength =
-        (enemy.kind === "interceptor" ? 0.52 : enemy.kind === "fighter" ? 0.25 : 0.12) *
-        ENEMY_AGILITY_SCALE;
-      desired.x += Math.sin(this.elapsed * 1.7 + enemy.phase) * weaveStrength;
-      desired.y += Math.cos(this.elapsed * 1.25 + enemy.phase) * weaveStrength * 0.6;
-
-      if (enemy.kind === "bomber" && distance < 190) {
-        desired.addScaledVector(
-          this.tempV3
-            .set(Math.sin(enemy.phase), Math.cos(enemy.phase), 0)
-            .normalize(),
-          0.8,
-        );
-      }
-
+      let avoidance: THREE.Vector3 | null = null;
       if (this.simulationTick % 3 === enemy.id % 3) {
         const nearby = this.findNearbyAsteroid(enemy.group.position, 28);
-        if (nearby) {
-          this.tempV3
+        if (nearby)
+          avoidance = this.tempV3
             .subVectors(enemy.group.position, nearby.position)
             .normalize();
-          desired.addScaledVector(this.tempV3, 1.65);
-        }
       }
-
-      desired.normalize();
+      const desired = enemyHeading(
+        enemy.kind,
+        enemy.phase,
+        this.elapsed,
+        toPlayer,
+        distance,
+        avoidance,
+        this.tempV2,
+      );
       this.tempQ1.setFromUnitVectors(LOCAL_FORWARD, desired);
-      const turnRate =
-        (enemy.kind === "interceptor" ? 1.75 : enemy.kind === "fighter" ? 1.18 : 0.72) *
-        ENEMY_AGILITY_SCALE;
+      const turnRate = enemyTurnRate(enemy.kind);
       enemy.group.quaternion.slerp(this.tempQ1, Math.min(1, turnRate * delta));
-      this.tempV3
-        .copy(LOCAL_FORWARD)
-        .applyQuaternion(enemy.group.quaternion);
+      this.tempV3.copy(LOCAL_FORWARD).applyQuaternion(enemy.group.quaternion);
       enemy.group.position.addScaledVector(this.tempV3, enemy.speed * delta);
 
       if (enemy.kind === "bomber") {
@@ -3098,7 +3080,11 @@ class DogfightEngine {
 
       const aimDot = this.tempV3.dot(toPlayer);
       const aimThreshold =
-        enemy.kind === "interceptor" ? 0.955 : enemy.kind === "bomber" ? 0.975 : 0.965;
+        enemy.kind === "interceptor"
+          ? 0.955
+          : enemy.kind === "bomber"
+            ? 0.975
+            : 0.965;
       const range = enemy.kind === "bomber" ? 520 : 430;
       if (enemy.cooldown <= 0 && aimDot > aimThreshold && distance < range) {
         this.fireEnemyLaser(enemy);
@@ -3115,7 +3101,8 @@ class DogfightEngine {
       .addScaledVector(forward, enemy.kind === "bomber" ? 4.8 : 2.3);
     const projectileSpeed =
       enemy.kind === "interceptor" ? 238 : enemy.kind === "bomber" ? 176 : 205;
-    const damage = enemy.kind === "bomber" ? 28 : enemy.kind === "interceptor" ? 11 : 14;
+    const damage =
+      enemy.kind === "bomber" ? 28 : enemy.kind === "interceptor" ? 11 : 14;
     const velocity = this.tempV3.copy(forward).multiplyScalar(projectileSpeed);
     this.spawnProjectile(false, position, velocity, damage, 3.4);
     if (enemy.kind === "bomber") {
@@ -3203,7 +3190,10 @@ class DogfightEngine {
         )
       ) {
         projectile.active = false;
-        this.spawnExplosion(projectile.position, projectile.damage > 20 ? 6 : 3);
+        this.spawnExplosion(
+          projectile.position,
+          projectile.damage > 20 ? 6 : 3,
+        );
         this.damagePlayer(projectile.damage);
       }
     }
@@ -3229,12 +3219,7 @@ class DogfightEngine {
   private destroyEnemy(enemy: Enemy) {
     enemy.active = false;
     enemy.group.visible = false;
-    const scoreByKind = {
-      fighter: 110,
-      interceptor: 175,
-      bomber: 340,
-    };
-    this.score += scoreByKind[enemy.kind] * this.wave;
+    this.score += enemyPoints(enemy.kind, this.wave);
     this.spawnExplosion(
       enemy.group.position,
       enemy.kind === "bomber" ? 18 : 10,
@@ -3245,13 +3230,9 @@ class DogfightEngine {
   private damagePlayer(amount: number) {
     this.lastDamageTime = this.elapsed;
     this.damageFlash = 1;
-    let remaining = amount;
-    if (this.shields > 0) {
-      const absorbed = Math.min(this.shields, remaining);
-      this.shields -= absorbed;
-      remaining -= absorbed;
-    }
-    if (remaining > 0) this.hull = Math.max(0, this.hull - remaining);
+    const damage = damageLayers(this.shields, this.hull, amount);
+    this.shields = damage.shields;
+    this.hull = damage.hull;
     this.audio.impact(amount > 20);
     if (this.hull <= 0) this.endGame();
   }
@@ -3266,7 +3247,9 @@ class DogfightEngine {
     const nearby = this.findNearbyAsteroid(this.player.position, 4);
     if (!nearby) return;
     const minDistance = nearby.radius + 2.7;
-    const distanceSquared = this.player.position.distanceToSquared(nearby.position);
+    const distanceSquared = this.player.position.distanceToSquared(
+      nearby.position,
+    );
     if (distanceSquared >= minDistance * minDistance) return;
     this.tempV1.subVectors(this.player.position, nearby.position);
     if (this.tempV1.lengthSq() < 0.001) this.tempV1.set(0, 1, 0);
@@ -3316,7 +3299,9 @@ class DogfightEngine {
     for (let x = -1; x <= 1; x += 1) {
       for (let y = -1; y <= 1; y += 1) {
         for (let z = -1; z <= 1; z += 1) {
-          const indices = this.asteroidGrid.get(this.gridKey(cx + x, cy + y, cz + z));
+          const indices = this.asteroidGrid.get(
+            this.gridKey(cx + x, cy + y, cz + z),
+          );
           if (!indices) continue;
           for (const index of indices) {
             const asteroid = this.asteroids[index];
@@ -3326,7 +3311,10 @@ class DogfightEngine {
             const distance =
               offsetX * offsetX + offsetY * offsetY + offsetZ * offsetZ;
             const threshold = asteroid.radius + padding;
-            if (distance < threshold * threshold && distance < closestDistance) {
+            if (
+              distance < threshold * threshold &&
+              distance < closestDistance
+            ) {
               closestDistance = distance;
               closest = asteroid;
               closestX = offsetX;
@@ -3452,7 +3440,8 @@ class DogfightEngine {
         continue;
       }
       const scale =
-        explosion.size * (0.3 + Math.sin(Math.min(1, progress) * Math.PI) * 1.2);
+        explosion.size *
+        (0.3 + Math.sin(Math.min(1, progress) * Math.PI) * 1.2);
       explosion.sprite.scale.setScalar(scale);
       (explosion.sprite.material as THREE.SpriteMaterial).opacity =
         1 - progress * progress;
@@ -3469,11 +3458,7 @@ class DogfightEngine {
       this.tempQ1.setFromUnitVectors(LOCAL_FORWARD, this.tempV1);
       const heavy = projectile.damage > 20 && !projectile.friendly;
       this.tempScale.set(heavy ? 2.1 : 1, heavy ? 2.1 : 1, heavy ? 1.45 : 1);
-      this.tempMatrix.compose(
-        projectile.position,
-        this.tempQ1,
-        this.tempScale,
-      );
+      this.tempMatrix.compose(projectile.position, this.tempQ1, this.tempScale);
       if (projectile.friendly) {
         this.playerLasers.setMatrixAt(friendlyCount, this.tempMatrix);
         friendlyCount += 1;
@@ -3728,6 +3713,7 @@ class DogfightEngine {
   }
 
   dispose() {
+    this.leaveCoop();
     this.disposed = true;
     this.releaseWakeLock();
     this.resizeObserver?.disconnect();
@@ -3737,7 +3723,10 @@ class DogfightEngine {
     window.removeEventListener("mousemove", this.onMouseMove);
     window.removeEventListener("mouseup", this.onCanvasMouseUp);
     window.removeEventListener("deviceorientation", this.onDeviceOrientation);
-    window.removeEventListener("orientationchange", this.onScreenOrientationChange);
+    window.removeEventListener(
+      "orientationchange",
+      this.onScreenOrientationChange,
+    );
     window.removeEventListener("touchstart", this.onTouchStart);
     window.removeEventListener("touchmove", this.onTouchMove);
     window.removeEventListener("touchend", this.onTouchEnd);
@@ -3880,7 +3869,11 @@ function SettingsPanel({
             <span className="menu-kicker">System configuration</span>
             <h2>Graphics & controls</h2>
           </div>
-          <button className="icon-btn" onClick={onClose} aria-label="Close settings">
+          <button
+            className="icon-btn"
+            onClick={onClose}
+            aria-label="Close settings"
+          >
             ×
           </button>
         </header>
@@ -3920,7 +3913,8 @@ function SettingsPanel({
 
           <label className="setting">
             <span>
-              Render scale <output>{Math.round(settings.renderScale * 100)}%</output>
+              Render scale{" "}
+              <output>{Math.round(settings.renderScale * 100)}%</output>
             </span>
             <input
               type="range"
@@ -3984,7 +3978,8 @@ function SettingsPanel({
 
           <label className="setting">
             <span>
-              Effects density <output>{Math.round(settings.effects * 100)}%</output>
+              Effects density{" "}
+              <output>{Math.round(settings.effects * 100)}%</output>
             </span>
             <input
               type="range"
@@ -4000,7 +3995,8 @@ function SettingsPanel({
 
           <label className="setting">
             <span>
-              Flight sensitivity <output>{settings.sensitivity.toFixed(1)}×</output>
+              Flight sensitivity{" "}
+              <output>{settings.sensitivity.toFixed(1)}×</output>
             </span>
             <input
               type="range"
@@ -4030,7 +4026,9 @@ function SettingsPanel({
             <input
               type="checkbox"
               checked={settings.shadows}
-              onChange={(event) => updateCustom("shadows", event.target.checked)}
+              onChange={(event) =>
+                updateCustom("shadows", event.target.checked)
+              }
             />
           </label>
 
@@ -4039,7 +4037,9 @@ function SettingsPanel({
             <input
               type="checkbox"
               checked={settings.invertY}
-              onChange={(event) => updateCustom("invertY", event.target.checked)}
+              onChange={(event) =>
+                updateCustom("invertY", event.target.checked)
+              }
             />
           </label>
 
@@ -4069,30 +4069,44 @@ function SettingsPanel({
 function MobileGuidePanel({ onClose }: { onClose: () => void }) {
   return (
     <div className="overlay">
-      <section className="pause-card mobile-guide-card" aria-label="Phone Setup Guide">
+      <section
+        className="pause-card mobile-guide-card"
+        aria-label="Phone Setup Guide"
+      >
         <span className="menu-kicker">Mobile Local Playtest Guide</span>
         <h2>iPhone 13 Pro Setup</h2>
         <div className="mobile-guide-content">
           <ol className="mobile-guide-steps">
             <li>
-              <strong>1. Connect Wi-Fi:</strong> Ensure iPhone 13 Pro is on the same local Wi-Fi network.
+              <strong>1. Connect Wi-Fi:</strong> Ensure iPhone 13 Pro is on the
+              same local Wi-Fi network.
             </li>
             <li>
-              <strong>2. Open Safari:</strong> Navigate to your desktop IP: <code>http://&lt;desktop-ip&gt;:3000</code>.
+              <strong>2. Open Safari:</strong> Navigate to your desktop IP:{" "}
+              <code>http://&lt;desktop-ip&gt;:3000</code>.
             </li>
             <li>
-              <strong>3. Allow Motion:</strong> Tap <strong>Allow</strong> when iOS Safari requests Device Motion access.
+              <strong>3. Allow Motion:</strong> Tap <strong>Allow</strong> when
+              iOS Safari requests Device Motion access.
             </li>
             <li>
-              <strong>4. Calibrate Tilt:</strong> Hold your phone comfortably and tap <strong>CALIB TILT</strong> to set zero angle.
+              <strong>4. Calibrate Tilt:</strong> Hold your phone comfortably
+              and tap <strong>CALIB TILT</strong> to set zero angle.
             </li>
           </ol>
           <div className="mobile-summary-box">
             <h4>Flight Gyro Controls:</h4>
             <ul>
-              <li><strong>Turn Right / Left:</strong> Tilt phone to the right or left</li>
-              <li><strong>Pitch Up (climb):</strong> Tilt top of phone toward you</li>
-              <li><strong>Dive Down:</strong> Tilt bottom of phone up</li>
+              <li>
+                <strong>Turn Right / Left:</strong> Tilt phone to the right or
+                left
+              </li>
+              <li>
+                <strong>Pitch Up (climb):</strong> Tilt top of phone toward you
+              </li>
+              <li>
+                <strong>Dive Down:</strong> Tilt bottom of phone up
+              </li>
             </ul>
           </div>
         </div>
@@ -4239,11 +4253,16 @@ function ControlsPanel({
 
 function GameHud({ hud }: { hud: HudSnapshot }) {
   const contactColor = (kind: EnemyKind) =>
-    kind === "bomber" ? "#72e9ff" : kind === "interceptor" ? "#ffb54a" : "#ff5c55";
+    kind === "bomber"
+      ? "#72e9ff"
+      : kind === "interceptor"
+        ? "#ffb54a"
+        : "#ff5c55";
   return (
-    <div className={`hud ${
-      hud.isTouchDevice ? "is-touch" : ""
-    }`} aria-live="off">
+    <div
+      className={`hud ${hud.isTouchDevice ? "is-touch" : ""}`}
+      aria-live="off"
+    >
       <div className="hud-top">
         <div className="hud-stat">
           Wave<strong>{String(hud.wave).padStart(2, "0")}</strong>
@@ -4261,7 +4280,10 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
           <span>Deflector shields</span>
           <strong>{Math.round(hud.shields)}%</strong>
         </div>
-        <div className="meter" style={{ "--bar": "#72e9ff" } as React.CSSProperties}>
+        <div
+          className="meter"
+          style={{ "--bar": "#72e9ff" } as React.CSSProperties}
+        >
           <span
             style={{ "--value": `${hud.shields}%` } as React.CSSProperties}
           />
@@ -4270,7 +4292,10 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
           <span>Hull integrity</span>
           <strong>{Math.round(hud.hull)}%</strong>
         </div>
-        <div className="meter" style={{ "--bar": "#ffb54a" } as React.CSSProperties}>
+        <div
+          className="meter"
+          style={{ "--bar": "#ffb54a" } as React.CSSProperties}
+        >
           <span style={{ "--value": `${hud.hull}%` } as React.CSSProperties} />
         </div>
         <div className="system-label">
@@ -4360,79 +4385,79 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
 
       {hud.isTouchDevice && (
         <div className="touch-overlay">
-        <div className="touch-top-bar">
-          {/* Only worth the room while motion
+          <div className="touch-top-bar">
+            {/* Only worth the room while motion
           needs the player's attention. */}
-          {hud.gyroPermission !== "granted" && (
-            <span className="touch-motion-status">
-              MOTION {hud.gyroPermission}
-            </span>
-          )}
-          <button
-            className="touch-btn touch-btn-util"
-            onPointerDown={(e) => {
-              e.preventDefault();
-              hud.onCalibrateGyro?.();
-            }}
-          >
-            <span>CALIB TILT</span>
-          </button>
-          <button
-            className="touch-btn touch-btn-util"
-            onPointerDown={(e) => {
-              e.preventDefault();
-              hud.onToggleCamera?.();
-            }}
-          >
-            <span>CAM ({hud.camera})</span>
-          </button>
-        </div>
+            {hud.gyroPermission !== "granted" && (
+              <span className="touch-motion-status">
+                MOTION {hud.gyroPermission}
+              </span>
+            )}
+            <button
+              className="touch-btn touch-btn-util"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                hud.onCalibrateGyro?.();
+              }}
+            >
+              <span>CALIB TILT</span>
+            </button>
+            <button
+              className="touch-btn touch-btn-util"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                hud.onToggleCamera?.();
+              }}
+            >
+              <span>CAM ({hud.camera})</span>
+            </button>
+          </div>
 
-        <div className="touch-left-cluster">
-          <button
-            className={`touch-btn touch-btn-boost ${hud.boostActive ? "active" : ""}`}
-            onPointerDown={(e) => {
-              e.preventDefault();
-              e.currentTarget.setPointerCapture(e.pointerId);
-              hud.onBoostStart?.();
-            }}
-            onPointerUp={(e) => {
-              e.preventDefault();
-              e.currentTarget.releasePointerCapture(e.pointerId);
-              hud.onBoostEnd?.();
-            }}
-            onPointerCancel={(e) => {
-              e.preventDefault();
-              hud.onBoostEnd?.();
-            }}
-            onLostPointerCapture={() => hud.onBoostEnd?.()}
-          >
-            <span>BOOST</span>
-          </button>
-        </div>
+          <div className="touch-left-cluster">
+            <button
+              className={`touch-btn touch-btn-boost ${hud.boostActive ? "active" : ""}`}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                hud.onBoostStart?.();
+              }}
+              onPointerUp={(e) => {
+                e.preventDefault();
+                e.currentTarget.releasePointerCapture(e.pointerId);
+                hud.onBoostEnd?.();
+              }}
+              onPointerCancel={(e) => {
+                e.preventDefault();
+                hud.onBoostEnd?.();
+              }}
+              onLostPointerCapture={() => hud.onBoostEnd?.()}
+            >
+              <span>BOOST</span>
+            </button>
+          </div>
 
-        <div className="touch-right-cluster">
-          <button
-            className="touch-btn touch-btn-fire"
-            onPointerDown={(e) => {
-              e.preventDefault();
-              e.currentTarget.setPointerCapture(e.pointerId);
-              hud.onFireStart?.();
-            }}
-            onPointerUp={(e) => {
-              e.preventDefault();
-              e.currentTarget.releasePointerCapture(e.pointerId);
-              hud.onFireEnd?.();
-            }}
-            onPointerCancel={(e) => {
-              e.preventDefault();
-              hud.onFireEnd?.();
-            }}
-            onLostPointerCapture={() => hud.onFireEnd?.()}
-          >
-            <span>FIRE</span>
-          </button>
-        </div>
+          <div className="touch-right-cluster">
+            <button
+              className="touch-btn touch-btn-fire"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                hud.onFireStart?.();
+              }}
+              onPointerUp={(e) => {
+                e.preventDefault();
+                e.currentTarget.releasePointerCapture(e.pointerId);
+                hud.onFireEnd?.();
+              }}
+              onPointerCancel={(e) => {
+                e.preventDefault();
+                hud.onFireEnd?.();
+              }}
+              onLostPointerCapture={() => hud.onFireEnd?.()}
+            >
+              <span>FIRE</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -4464,6 +4489,15 @@ function GameHud({ hud }: { hud: HudSnapshot }) {
   );
 }
 
+function subscribeToLocation(callback: () => void) {
+  window.addEventListener("storage", callback);
+  window.addEventListener("popstate", callback);
+  return () => {
+    window.removeEventListener("storage", callback);
+    window.removeEventListener("popstate", callback);
+  };
+}
+
 export function StarfighterGame() {
   const engineRef = useRef<DogfightEngine | null>(null);
   const [status, setStatus] = useState<GameStatus>("loading");
@@ -4474,6 +4508,55 @@ export function StarfighterGame() {
   const [showMobileGuide, setShowMobileGuide] = useState(false);
   const [highScore, setHighScore] = useState(loadHighScore);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [callsign, setCallsign] = useState("Rogue One");
+  const [squad, setSquad] = useState("Rogue Squadron");
+  const [coopView, setCoopView] = useState<CoopView | null>(null);
+  const [coopError, setCoopError] = useState("");
+  const [joining, setJoining] = useState(false);
+  const invite = useSyncExternalStore(
+    subscribeToLocation,
+    () => new URLSearchParams(window.location.search).get("room") ?? "",
+    () => "",
+  );
+  const canReconnect = useSyncExternalStore(
+    subscribeToLocation,
+    () => !!sessionStorage.getItem("xwing-reconnect"),
+    () => false,
+  );
+  const [copied, setCopied] = useState(false);
+
+  const joinCoop = async (
+    action: "quick" | "private" | "invite" | "reconnect",
+  ) => {
+    if (!engineRef.current || joining) return;
+    setJoining(true);
+    setCopied(false);
+    setCoopError("");
+    const client = new CoopClient(
+      process.env.NEXT_PUBLIC_MULTIPLAYER_URL ??
+        "https://xwing-mp.amilajack.com",
+      setCoopView,
+    );
+    try {
+      await client.join(action, callsign, squad, invite);
+      engineRef.current.startCoop(client);
+    } catch (error) {
+      client.leave();
+      setCoopView(null);
+      setCoopError(
+        error instanceof Error && error.name !== "TypeError"
+          ? error.message
+          : "Could not reach co-op. Try Chrome/Edge and a network allowing UDP 443, or launch single-player.",
+      );
+    } finally {
+      setJoining(false);
+    }
+  };
+  const leaveCoop = () => {
+    engineRef.current?.showMenu();
+    setCoopView(null);
+    window.dispatchEvent(new Event("storage"));
+  };
 
   const callbacks = useMemo<GameCallbacks>(
     () => ({
@@ -4526,7 +4609,10 @@ export function StarfighterGame() {
         `${visual?.height ?? window.innerHeight}px`,
       );
       style.setProperty("--viewport-offset-top", `${visual?.offsetTop ?? 0}px`);
-      style.setProperty("--viewport-offset-left", `${visual?.offsetLeft ?? 0}px`);
+      style.setProperty(
+        "--viewport-offset-left",
+        `${visual?.offsetLeft ?? 0}px`,
+      );
     };
     updateViewport();
     window.addEventListener("resize", updateViewport, { passive: true });
@@ -4617,86 +4703,202 @@ export function StarfighterGame() {
           <section className="pause-card">
             <span className="menu-kicker">Loading glTF flight assets</span>
             <h2>Preparing hangar</h2>
-            <p>
-              Loading detailed fighter, interceptor, and bomber geometry…
-            </p>
+            <p>Loading detailed fighter, interceptor, and bomber geometry…</p>
           </section>
         </div>
       )}
 
       {status === "playing" && <GameHud hud={hud} />}
-
-      {status === "menu" && !showSettings && !showControls && !showMobileGuide && (
-        <div className="overlay">
-          <section className="menu">
-            <span className="menu-kicker">XW / 77 combat simulator</span>
-            <h1>
-              Rogue <em>Vector</em>
-            </h1>
-            <p className="menu-copy">
-              Break formation. Survive escalating Imperial attack waves through a
-              live asteroid field. Three hostile signatures detected—each with a
-              different flight doctrine.
-            </p>
-            <div className="threat-row">
-              <span className="threat-chip">TIE fighter // pursuit</span>
-              <span className="threat-chip">TIE interceptor // flanker</span>
-              <span className="threat-chip">Stealth bomber // heavy</span>
-            </div>
-            <div className="menu-actions">
-              <button className="primary-btn" onClick={begin}>
-                Launch fighter
-              </button>
-              <button className="secondary-btn" onClick={openSettings}>
-                Graphics
-              </button>
-              <button className="secondary-btn" onClick={openControls}>
-                Controls
-              </button>
-              <button className="secondary-btn" onClick={openMobileGuide}>
-                Phone Setup
-              </button>
-            </div>
-            <footer className="menu-footer">
-              <span>WebGL2 // Desktop & Mobile gyro flight system</span>
-              <span>{scoreLine}</span>
-            </footer>
-          </section>
-        </div>
-      )}
-
-      {status === "paused" && !showSettings && !showControls && !showMobileGuide && (
-        <div className="overlay">
-          <section className="pause-card">
-            <span className="menu-kicker">Flight suspended</span>
-            <h2>Paused</h2>
-            <p>Simulation held. Resume when your flight controls are ready.</p>
-            <div className="pause-actions">
-              <button
-                className="primary-btn"
-                onClick={() => engineRef.current?.resume()}
-              >
-                Resume
-              </button>
-              <button className="secondary-btn" onClick={openSettings}>
-                Graphics
-              </button>
-              <button className="secondary-btn" onClick={openControls}>
-                Controls
-              </button>
-              <button className="secondary-btn" onClick={openMobileGuide}>
-                Phone Setup
-              </button>
+      {coopView && status !== "menu" && (
+        <aside className="squad-panel" aria-label="Squad status">
+          <strong>{coopView.squad}</strong>
+          <span role="status">{coopView.message}</span>
+          <span>
+            Wave {coopView.state?.wave ?? 1} {"//"} Team score{" "}
+            {coopView.state?.score ?? 0}
+          </span>
+          {coopView.state?.pilots.map((p) => (
+            <span key={p.id}>
+              ◇ {p.callsign}
+              {p.id === coopView.pilot ? " (you)" : ""} {"//"} {p.kills} kills{" "}
+              {"//"} {p.connected ? "online" : "reserved"}
+              {p.hull <= 0
+                ? ` // Respawn ${Math.max(0, Math.ceil((p.respawnAt - coopView.state!.tick) / 60))}s`
+                : ""}
+            </span>
+          ))}
+          <div>
+            {coopView.invite && (
               <button
                 className="secondary-btn"
-                onClick={() => engineRef.current?.showMenu()}
+                onClick={() => {
+                  const url = new URL(window.location.href);
+                  url.search = "";
+                  url.searchParams.set("room", coopView.invite!);
+                  void navigator.clipboard
+                    .writeText(url.href)
+                    .then(() => setCopied(true))
+                    .catch(() =>
+                      setCoopError(
+                        "Clipboard unavailable. Invite: " + url.href,
+                      ),
+                    );
+                }}
               >
-                Abort sortie
+                {copied ? "Invite copied" : "Copy invite"}
               </button>
-            </div>
-          </section>
-        </div>
+            )}
+            <button className="secondary-btn" onClick={leaveCoop}>
+              Leave squad
+            </button>
+          </div>
+          {coopError && <span role="alert">{coopError}</span>}
+        </aside>
       )}
+
+      {status === "menu" &&
+        !showSettings &&
+        !showControls &&
+        !showMobileGuide && (
+          <div className="overlay">
+            <section className="menu">
+              <span className="menu-kicker">XW / 77 combat simulator</span>
+              <h1>
+                Rogue <em>Vector</em>
+              </h1>
+              <p className="menu-copy">
+                Break formation. Survive escalating Imperial attack waves
+                through a live asteroid field. Three hostile signatures
+                detected—each with a different flight doctrine.
+              </p>
+              <div className="threat-row">
+                <span className="threat-chip">TIE fighter // pursuit</span>
+                <span className="threat-chip">TIE interceptor // flanker</span>
+                <span className="threat-chip">Stealth bomber // heavy</span>
+              </div>
+              <div className="menu-actions">
+                <button
+                  className="primary-btn"
+                  disabled={joining}
+                  onClick={begin}
+                >
+                  Launch fighter
+                </button>
+                <button className="secondary-btn" onClick={openSettings}>
+                  Graphics
+                </button>
+                <button className="secondary-btn" onClick={openControls}>
+                  Controls
+                </button>
+                <button className="secondary-btn" onClick={openMobileGuide}>
+                  Phone Setup
+                </button>
+              </div>
+              <fieldset className="coop-lobby" disabled={joining}>
+                <legend>Co-op // Up to four pilots</legend>
+                <label>
+                  Callsign
+                  <input
+                    aria-label="Callsign"
+                    maxLength={20}
+                    value={callsign}
+                    onChange={(e) => setCallsign(e.target.value)}
+                  />
+                </label>
+                <label>
+                  Squad name
+                  <input
+                    aria-label="Squad name"
+                    maxLength={24}
+                    value={squad}
+                    onChange={(e) => setSquad(e.target.value)}
+                  />
+                </label>
+                <div className="menu-actions">
+                  {invite ? (
+                    <button
+                      className="secondary-btn"
+                      onClick={() => void joinCoop("invite")}
+                    >
+                      Join invited squad
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        className="secondary-btn"
+                        onClick={() => void joinCoop("quick")}
+                      >
+                        Quick Join
+                      </button>
+                      <button
+                        className="secondary-btn"
+                        onClick={() => void joinCoop("private")}
+                      >
+                        Create private room
+                      </button>
+                    </>
+                  )}
+                  {canReconnect && (
+                    <button
+                      className="secondary-btn"
+                      onClick={() => void joinCoop("reconnect")}
+                    >
+                      Reconnect
+                    </button>
+                  )}
+                </div>
+                {joining && <p role="status">Connecting to squad…</p>}
+                {coopError && <p role="alert">{coopError}</p>}
+              </fieldset>
+              <footer className="menu-footer">
+                <span>WebGL2 // Desktop & Mobile gyro flight system</span>
+                <span>{scoreLine}</span>
+              </footer>
+            </section>
+          </div>
+        )}
+
+      {status === "paused" &&
+        !showSettings &&
+        !showControls &&
+        !showMobileGuide && (
+          <div className="overlay">
+            <section className="pause-card">
+              <span className="menu-kicker">Flight suspended</span>
+              <h2>Paused</h2>
+              <p>
+                {coopView
+                  ? "Squad combat continues. Your ship remains vulnerable while this menu is open."
+                  : "Simulation held. Resume when your flight controls are ready."}
+              </p>
+              <div className="pause-actions">
+                <button
+                  className="primary-btn"
+                  onClick={() => engineRef.current?.resume()}
+                >
+                  Resume
+                </button>
+                <button className="secondary-btn" onClick={openSettings}>
+                  Graphics
+                </button>
+                <button className="secondary-btn" onClick={openControls}>
+                  Controls
+                </button>
+                <button className="secondary-btn" onClick={openMobileGuide}>
+                  Phone Setup
+                </button>
+                <button
+                  className="secondary-btn"
+                  onClick={() =>
+                    coopView ? leaveCoop() : engineRef.current?.showMenu()
+                  }
+                >
+                  Abort sortie
+                </button>
+              </div>
+            </section>
+          </div>
+        )}
 
       {status === "gameover" && (
         <div className="overlay">
@@ -4732,7 +4934,8 @@ export function StarfighterGame() {
             <h2>WebGL2 required</h2>
             <p>
               Rogue Vector supports WebGL2 on desktop and mobile browsers
-              (Chrome, Edge, Firefox, and Safari) with hardware acceleration enabled.
+              (Chrome, Edge, Firefox, and Safari) with hardware acceleration
+              enabled.
             </p>
           </section>
         </div>
@@ -4744,8 +4947,8 @@ export function StarfighterGame() {
             <span className="menu-kicker">Asset loading interrupted</span>
             <h2>Hangar unavailable</h2>
             <p>
-              One or more local glTF ship assets could not be loaded. Refresh the
-              page after confirming the development server is running.
+              One or more local glTF ship assets could not be loaded. Refresh
+              the page after confirming the development server is running.
             </p>
           </section>
         </div>
