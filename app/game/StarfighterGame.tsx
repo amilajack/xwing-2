@@ -41,6 +41,18 @@ declare global {
       fireAtPlayer: (distance: number) => void;
       /** Flies the player and moves bolts, with no enemies acting. */
       flyForSteps: (steps: number) => void;
+      /**
+       * Fires one player bolt and reports,
+       * in world space, where the bolt and
+       * its muzzle flash start and where
+       * the drawn model's cannon tip is.
+       */
+      fireCannon: () => {
+        bolt: [number, number, number];
+        flash: [number, number, number];
+        cannonTip: [number, number, number];
+        modelRoll: number;
+      };
       snapshot: () => {
         status: GameStatus;
         quality: QualityName;
@@ -1341,9 +1353,12 @@ class DogfightEngine {
   private mouseFire = false;
   private muzzleFlashes: Array<{ sprite: THREE.Sprite; life: number }> = [];
   /**
-   * Rolls with the model, which banks inside the flight frame.
+   * Holds effects fixed to the ship,
+   * such as muzzle flashes and engine glows:
+   * the model banks and rolls inside the
+   * flight frame, and this rolls with it.
    */
-  private exhaustMount = new THREE.Group();
+  private modelRollMount = new THREE.Group();
   private exhaustLayers: Record<"halo" | "core" | "flare", THREE.Sprite[]> = {
     halo: [],
     core: [],
@@ -1544,6 +1559,25 @@ class DogfightEngine {
           this.updateProjectiles(FIXED_STEP);
         }
       },
+      fireCannon: () => {
+        const bolt = this.projectiles.find((projectile) => !projectile.active);
+
+        if (!bolt) throw new Error("No free projectile to fire.");
+
+        this.firePlayerLaser();
+        this.scene.updateMatrixWorld();
+
+        const muzzle = PLAYER_CANNON_MUZZLES[this.muzzleIndex];
+
+        return {
+          bolt: bolt.position.toArray(),
+          flash: this.muzzleFlashes[this.muzzleIndex].sprite
+            .getWorldPosition(new THREE.Vector3())
+            .toArray(),
+          cannonTip: this.playerModel.localToWorld(muzzle.clone()).toArray(),
+          modelRoll: this.playerModel.rotation.z,
+        };
+      },
       snapshot: () => {
         const activeEnemies = {
           fighter: 0,
@@ -1675,7 +1709,7 @@ class DogfightEngine {
     this.player = new THREE.Group();
     this.player.name = "player-flight-frame";
     this.playerModel = this.cloneShipModel("player");
-    this.player.add(this.playerModel);
+    this.player.add(this.playerModel, this.modelRollMount);
     this.player.add(new THREE.PointLight(0xb9eaff, 7, 42, 2));
     this.scene.add(this.player);
     this.cockpit = createCockpitRig(this.assets);
@@ -2910,6 +2944,7 @@ class DogfightEngine {
       this.maneuverRoll = 0;
     }
     this.playerModel.rotation.z = this.bankRoll + this.maneuverRoll;
+    this.modelRollMount.rotation.z = this.playerModel.rotation.z;
 
     this.tempEuler.set(
       this.angularVelocity.x * delta + maneuverStep.pitch,
@@ -2976,6 +3011,7 @@ class DogfightEngine {
 
     const muzzle = this.tempV4
       .copy(PLAYER_CANNON_MUZZLES[this.muzzleIndex])
+      .applyEuler(this.modelRollMount.rotation)
       .applyQuaternion(this.player.quaternion)
       .add(this.player.position);
     const boltSpeed = this.playerBoltSpeed();
@@ -3366,7 +3402,7 @@ class DogfightEngine {
 
       sprite.position.copy(muzzle);
       sprite.visible = false;
-      this.player.add(sprite);
+      this.modelRollMount.add(sprite);
       this.muzzleFlashes.push({ sprite, life: 0 });
     }
   }
@@ -3398,12 +3434,11 @@ class DogfightEngine {
         const sprite = new THREE.Sprite(material);
 
         sprite.position.copy(nozzle);
-        this.exhaustMount.add(sprite);
+        this.modelRollMount.add(sprite);
         sprites.push(sprite);
       }
     }
 
-    this.player.add(this.exhaustMount);
     this.updateExhausts();
   }
 
@@ -3414,7 +3449,6 @@ class DogfightEngine {
     const flicker =
       1 + 0.07 * Math.sin(this.elapsed * 47) + 0.05 * Math.sin(this.elapsed * 83);
 
-    this.exhaustMount.rotation.z = this.playerModel.rotation.z;
     halo[0].material.opacity = (0.45 + boost * 0.55) * flicker;
     core[0].material.opacity = (0.5 + boost * 0.5) * flicker;
     flare[0].material.opacity = boost * 0.7 * flicker;
